@@ -75,11 +75,10 @@ class MoLConvSwiGLU(nn.Module):
             op_vec = op_embed.squeeze(1) if op_embed.dim() == 3 else op_embed
         router_in = torch.cat([mean_tok, op_vec], dim=-1)
         router_logits = self.router(router_in)               # (B, K)
-        # v40.10: add gumbel-style noise during training to break router
-        # symmetry. Without it, top-1 argmax collapses to one expert.
+        # v40.11: gaussian noise during training breaks router symmetry without
+        # the fp16-unfriendly double-log of the original Gumbel formulation.
         if self.training:
-            noise = -torch.log(-torch.log(torch.rand_like(router_logits) + 1e-9) + 1e-9)
-            router_logits = router_logits + 0.5 * noise
+            router_logits = router_logits + torch.randn_like(router_logits) * 0.5
         top1_idx = router_logits.argmax(dim=-1)              # (B,)
         usage = F.one_hot(top1_idx, num_classes=self.n_experts).float().mean(dim=0)
         self.last_expert_usage = usage.detach()
