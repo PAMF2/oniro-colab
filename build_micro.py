@@ -1,15 +1,15 @@
-"""Build ONIRO v40.0 Colab notebook.
+"""Build ONIRO v40.1 Colab notebook.
 
-v40.0 (math-as-code, sub-version 1 of 3):
-    - Op-conditioning: OpEmbedding(32, D) injected as first token of URM input
-    - Dual-encoder split: PatchEncoder (vision) for ARC, MathPatchEncoder (numeric)
-      for math/sudoku/CA/compose. Both produce 100 tokens.
-    - MoL (Mixture of LoRAs) on ConvSwiGLU: 4 LoRA experts top-1 routed by router
-      conditioned on (mean tokens, op_embed). +280k params.
-    - AlphaEvolve-Godel population_size=4 every 2k steps
-    - 32-op vocabulary tagged per sample (math_gen_v2 ops, sudoku, CA, compose)
+v40.1 (math-as-code, sub-version 2 of 3):
+    All v40.0 features (op-conditioning, dual encoder split, MoL FFN, ES expansion)
+    PLUS:
+    - Problem-level self-simulate scoring (Maimon 2604.03253 + FFDC 2605.06222
+      at task scope): each TTA augmentation is scored by how well the model
+      reproduces demo outputs from demo inputs under that augmentation.
+    - Weighted TTA majority: augmentations below SELF_SIM_THRESHOLD filtered out.
+    - MCTS-lite hybrid eval (AlphaLLM 2404.12253): DSL solver + neural op_id
+      sweep, scored by demo-fit, picks best candidate per test grid.
 
-Coming in v40.1: problem-level self_simulate + weighted TTA + MCTS hybrid.
 Coming in v40.2: CodeHead + CGAR PDC/HSW curriculum.
 
 Pulls source from https://github.com/PAMF2/oniro-colab (public).
@@ -41,21 +41,24 @@ def code(text: str) -> dict:
 def main() -> None:
     cells = []
     cells.append(md(textwrap.dedent("""
-        # ONIRO v40.0 — Op-conditioning + MoL + Dual-encoder split
+        # ONIRO v40.1 — Self-simulate weighted TTA + MCTS hybrid
 
         **Setup:** Runtime → Change runtime type → **T4 GPU** → Save → Run All.
 
-        v40.0 upgrades over v37.1:
-        - **Op-conditioning**: 32-op vocabulary, OpEmbedding token prepended to URM input
-        - **Dual-encoder split**: PatchEncoder (vision) for ARC tasks, MathPatchEncoder
-          (per-row numeric features) for math/sudoku/CA/compose
-        - **MoL (Mixture of LoRAs)**: 4 LoRA experts top-1 routed by (mean tokens, op_embed)
-          on ConvSwiGLU. +280k params, paper arxiv:2512.12880.
-        - **AlphaEvolve-Godel population_size=4** every 2k steps for ES expansion
-        - **Math-v2 (21 ops) tagged with op_id** so model learns each operation explicitly
-        - Retained from v37.1: GQA + KV cache + EMA + RIMA + Socrates Loss + 128-TTA
+        v40.1 upgrades over v40.0:
+        - **Problem-level self-simulate** (Maimon arxiv:2604.03253 + FFDC arxiv:2605.06222)
+          at task scope: each TTA augmentation scored by how well the model reproduces
+          demo outputs from demo inputs.
+        - **Weighted TTA majority**: augs below SELF_SIM_THRESHOLD (default 0.5) filtered.
+        - **MCTS-lite hybrid eval** (AlphaLLM arxiv:2404.12253): DSL solver + neural
+          op_id sweep, scored by demo-fit, picks best candidate.
 
-        Coming in v40.1: problem-level self_simulate + MCTS hybrid.
+        Retained from v40.0:
+        - Op-conditioning (32-op vocabulary, OpEmbedding token at position 0)
+        - Dual-encoder split (vision PatchEncoder for ARC, MathPatchEncoder for numeric)
+        - MoL ConvSwiGLU (4 LoRA experts top-1 routed)
+        - AlphaEvolve-Godel population_size=4 ES expansion every 2k steps
+
         Coming in v40.2: CodeHead + CGAR PDC/HSW curriculum.
 
         Runtime ~7-9h on Colab T4.
@@ -549,40 +552,81 @@ def main() -> None:
                    str(ckpt_dir / 'urm_v40_0_final.pt'))
     """).strip()))
 
-    cells.append(md("## ARC eval — 128-sample TTA majority vote (Socrates argmax + op_id=ARC_GENERIC)"))
+    cells.append(md("## ARC eval — self-simulate-weighted TTA (v40.1)"))
     cells.append(code(textwrap.dedent("""
+        from oniro.eval.self_simulate import weighted_tta_majority
+
         for m in all_modules: m.eval()
 
         N_TTA = int(os.environ.get('ONIRO_TTA', '128'))
+        SELF_SIM_THRESHOLD = float(os.environ.get('ONIRO_SELF_SIM_THRESHOLD', '0.5'))
 
-        # Eval defaults: op_id=ARC_GENERIC (id 0), is_arc=True (vision pathway).
         EVAL_OP_ID = torch.tensor([OP_ID["ARC_GENERIC"]], dtype=torch.long, device=device)
         EVAL_ARC_MASK = torch.tensor([1.0], dtype=torch.float, device=device)
 
         @torch.no_grad()
-        def tta_majority_vote(grid_int_t, n_samples=N_TTA):
-            votes = torch.zeros(N_COLORS, GRID, GRID, device=device)
-            gnp = grid_int_t.cpu().numpy()
-            for s in range(n_samples):
+        def neural_predict_with_aug(grid_int_t, k, flip, cp):
+            '''Apply (rot k, flip, color perm cp) then forward and invert.
+
+            Returns the prediction back in the canonical (un-augmented) frame.
+            '''
+            gnp = grid_int_t.cpu().numpy() if isinstance(grid_int_t, torch.Tensor) else grid_int_t
+            inv_cp = np.argsort(cp).astype(np.int64)
+            gaug = dihedral_aug(gnp, k, flip)
+            gaug = apply_color_perm(gaug, cp)
+            t = grid_to_fixed(gaug).unsqueeze(0).to(device)
+            urm_input, op_tok = encode_v40(t, EVAL_OP_ID, EVAL_ARC_MASK)
+            u = urm(urm_input, op_embed=op_tok)
+            l = decoder(u['final_state'], GRID)
+            pred = socrates_argmax(l, n_colors=N_COLORS, unknown_class=N_COLORS)[0]
+            pred_np = pred.cpu().numpy()
+            pred_np = apply_color_perm(pred_np.astype(np.int64), inv_cp)
+            pred = torch.from_numpy(pred_np).to(device)
+            if flip:
+                pred = torch.flip(pred, dims=(-1,))
+            pred = torch.rot90(pred, k=-k, dims=(-2, -1))
+            return pred
+
+        @torch.no_grad()
+        def _self_sim_score_demos(demos_pt, k, flip, cp):
+            '''Score how well the model reproduces demos under augmentation (k, flip, cp).
+            Returns mean cell-acc across all demos.
+            '''
+            if not demos_pt:
+                return 0.5  # neutral when no demos available
+            total = 0.0
+            for di, do in demos_pt:
+                pred = neural_predict_with_aug(di, k, flip, cp)
+                # match in the canonical frame (di and do already canonical)
+                h = min(pred.shape[-2], do.shape[-2])
+                w = min(pred.shape[-1], do.shape[-1])
+                match = float((pred[..., :h, :w] == do[..., :h, :w]).float().mean())
+                total += match
+            return total / len(demos_pt)
+
+        @torch.no_grad()
+        def tta_selfsim_vote(test_grid_int, demos_pt, n_samples=N_TTA):
+            '''Self-simulate-weighted TTA majority. Each augmentation is scored
+            by demo reproduction under that augmentation; only augmentations
+            above SELF_SIM_THRESHOLD contribute weighted votes.
+            '''
+            aug_seeds = []
+            for _ in range(n_samples):
                 k = rng.randint(0, 3); flip = rng.random() < 0.5
                 cp = random_color_perm(rng, n_colors=N_COLORS, keep_bg=True)
-                inv_cp = np.argsort(cp).astype(np.int64)
-                gaug = dihedral_aug(gnp, k, flip)
-                gaug = apply_color_perm(gaug, cp)
-                t = grid_to_fixed(gaug).unsqueeze(0).to(device)
-                urm_input, op_tok = encode_v40(t, EVAL_OP_ID, EVAL_ARC_MASK)
-                u = urm(urm_input, op_embed=op_tok)
-                l = decoder(u['final_state'], GRID)
-                pred = socrates_argmax(l, n_colors=N_COLORS, unknown_class=N_COLORS)[0]
-                pred_np = pred.cpu().numpy()
-                pred_np = apply_color_perm(pred_np.astype(np.int64), inv_cp)
-                pred = torch.from_numpy(pred_np).to(device)
-                if flip:
-                    pred = torch.flip(pred, dims=(-1,))
-                pred = torch.rot90(pred, k=-k, dims=(-2, -1))
-                for c in range(N_COLORS):
-                    votes[c] += (pred == c).float()
-            return votes.argmax(dim=0)
+                aug_seeds.append((k, flip, cp))
+
+            def fwd_with_aug(_test, idx):
+                k, flip, cp = aug_seeds[idx]
+                pred = neural_predict_with_aug(_test, k, flip, cp)
+                score = _self_sim_score_demos(demos_pt, k, flip, cp)
+                return pred, score
+
+            return weighted_tta_majority(
+                fwd_with_aug, test_grid_int,
+                n_colors=N_COLORS, grid_size=GRID, n_samples=n_samples,
+                threshold=SELF_SIM_THRESHOLD, device=device,
+            )
 
         def eval_arc_tta(root, label):
             sd = Path(root) / 'evaluation'
@@ -592,12 +636,18 @@ def main() -> None:
                 for ti, tf in enumerate(files):
                     with tf.open() as f:
                         task = _json.load(f)
+                    # demos for self-simulate scoring (canonical frame)
+                    demos_pt = []
+                    for tp in task.get('train', []):
+                        di = grid_to_fixed(tp['input']).to(device)
+                        do = grid_to_fixed(tp['output']).to(device)
+                        demos_pt.append((di, do))
                     solved = []
                     for tp in task.get('test', []):
                         if 'output' not in tp: continue
                         gi = grid_to_fixed(tp['input']).to(device)
                         gt = grid_to_fixed(tp['output']).to(device)
-                        pred = tta_majority_vote(gi)
+                        pred = tta_selfsim_vote(gi, demos_pt)
                         exact = bool((pred == gt).all().item())
                         n_t += 1
                         if exact: n_pe += 1
@@ -607,76 +657,106 @@ def main() -> None:
                         tt += 1
                         if all(solved): ts += 1
                     if (ti + 1) % 30 == 0:
-                        print(f'  {label} TTA{N_TTA} [{ti+1}/{len(files)}] exact={n_pe}/{n_t}')
+                        print(f'  {label} TTAss{N_TTA} [{ti+1}/{len(files)}] exact={n_pe}/{n_t}')
             return {'label': label, 'pairs_total': n_t, 'pairs_exact': n_pe,
                     'pair_exact_acc': n_pe / max(n_t, 1),
                     'mean_cell_acc': sum(cells_c)/max(len(cells_c), 1),
                     'tasks_total': tt, 'tasks_solved': ts,
-                    'task_acc': ts / max(tt, 1), 'tta_samples': N_TTA}
+                    'task_acc': ts / max(tt, 1), 'tta_samples': N_TTA,
+                    'selfsim_threshold': SELF_SIM_THRESHOLD}
 
         results = {}
-        print(f'=== ARC-AGI-1 (TTA {N_TTA}) ===')
+        print(f'=== ARC-AGI-1 (self-sim TTA {N_TTA}, threshold={SELF_SIM_THRESHOLD}) ===')
         results['arc1'] = eval_arc_tta(ARC1_ROOT, 'ARC-1')
         print(_json.dumps(results['arc1'], indent=2))
-        print(f'=== ARC-AGI-2 (TTA {N_TTA}) ===')
+        print(f'=== ARC-AGI-2 (self-sim TTA {N_TTA}) ===')
         results['arc2'] = eval_arc_tta(ARC2_ROOT, 'ARC-2')
         print(_json.dumps(results['arc2'], indent=2))
     """).strip()))
 
-    cells.append(md("## DSL Hybrid + procedural eval"))
+    cells.append(md("## MCTS hybrid eval — DSL + neural over op_vocab (v40.1)"))
     cells.append(code(textwrap.dedent("""
         from oniro.dsl.solver import solve_task as dsl_solve_task
+        from oniro.eval.mcts_search import mcts_search
 
         @torch.no_grad()
-        def neural_predict_np(grid_np):
+        def neural_predict_np(grid_np, op_id=None):
+            '''Forward with optional op_id (default ARC_GENERIC). For mcts_search.'''
+            if op_id is None:
+                op_id = OP_ID["ARC_GENERIC"]
             gi = grid_to_fixed(grid_np.tolist()).unsqueeze(0).to(device)
-            urm_input, op_tok = encode_v40(gi, EVAL_OP_ID, EVAL_ARC_MASK)
+            op_t = torch.tensor([int(op_id)], dtype=torch.long, device=device)
+            arc_m = torch.tensor([1.0 if op_id in (OP_ID["ARC_GENERIC"], OP_ID["ARC_RE"],
+                                                    OP_ID["ARC_CONCEPT"], OP_ID["ARC_MINI"],
+                                                    OP_ID["ARC_HEAVY"]) else 0.0],
+                                  dtype=torch.float, device=device)
+            urm_input, op_tok = encode_v40(gi, op_t, arc_m)
             u = urm(urm_input, op_embed=op_tok)
             l = decoder(u['final_state'], GRID)
             return socrates_argmax(l, n_colors=N_COLORS, unknown_class=N_COLORS)[0].cpu().numpy().astype(np.int8)
 
-        def eval_arc_hybrid(root, label, max_dsl_depth=3):
+        # Candidate op_ids for MCTS sweep (ARC tasks: ARC_GENERIC + variants + UNKNOWN)
+        MCTS_OP_VOCAB = [OP_ID["ARC_GENERIC"], OP_ID["ARC_RE"], OP_ID["UNKNOWN_OP"]]
+
+        def eval_arc_mcts_hybrid(root, label, max_dsl_depth=3):
+            '''MCTS-style search: try DSL solver, then sweep neural op_ids,
+            score each by demo reproduction, commit best to test grid.
+            '''
             sd = Path(root) / 'evaluation'
             files = sorted(sd.glob('*.json'))
-            n_pe = 0; n_t = 0; cells_c = []; ts = 0; tt = 0; n_dsl_solved = 0
+            n_pe = 0; n_t = 0; cells_c = []; ts = 0; tt = 0; method_counts = {}
             with ema.swap_in():
                 for ti, tf in enumerate(files):
                     with tf.open() as f:
                         task = _json.load(f)
-                    res = dsl_solve_task(task, neural_fallback=neural_predict_np, max_depth=max_dsl_depth)
+                    # canonical-frame demos as numpy
+                    demos_np = []
+                    for tp in task.get('train', []):
+                        demos_np.append((np.asarray(tp['input'], dtype=np.int8),
+                                          np.asarray(tp['output'], dtype=np.int8)))
                     solved = []
-                    for i, tp in enumerate(task.get('test', [])):
+                    for tp in task.get('test', []):
                         if 'output' not in tp: continue
+                        test_np = np.asarray(tp['input'], dtype=np.int8)
                         gt = np.asarray(tp['output'], dtype=np.int8)
-                        pred = res['predictions'][i] if i < len(res['predictions']) else None
-                        if pred is None:
-                            pred = neural_predict_np(np.asarray(tp['input'], dtype=np.int8))
+                        # MCTS over op_ids + DSL solver
+                        res = mcts_search(
+                            neural_predict_np, demos_np, test_np,
+                            op_vocab=MCTS_OP_VOCAB,
+                            dsl_solver=lambda td: dsl_solve_task(
+                                td, neural_fallback=lambda g: neural_predict_np(g),
+                                max_depth=max_dsl_depth),
+                            dsl_task_dict=task,
+                            branching=3,
+                            n_colors=N_COLORS,
+                            grid_size=GRID,
+                        )
+                        pred = res['pred']
+                        method_counts[res['method']] = method_counts.get(res['method'], 0) + 1
                         if pred.shape == gt.shape:
                             exact = bool(np.array_equal(pred, gt))
                             cell_acc = float((pred == gt).mean())
                         else:
                             exact = False; cell_acc = 0.0
                         n_t += 1
-                        if exact:
-                            n_pe += 1
-                            if res['method'] == 'dsl': n_dsl_solved += 1
+                        if exact: n_pe += 1
                         cells_c.append(cell_acc); solved.append(exact)
                     if solved:
                         tt += 1
                         if all(solved): ts += 1
                     if (ti + 1) % 50 == 0:
-                        print(f'  {label}-hybrid [{ti+1}/{len(files)}] exact={n_pe}/{n_t}  dsl_solved={n_dsl_solved}')
-            return {'label': label+'-hybrid', 'pairs_total': n_t, 'pairs_exact': n_pe,
+                        print(f'  {label}-mcts [{ti+1}/{len(files)}] exact={n_pe}/{n_t}')
+            return {'label': label+'-mcts', 'pairs_total': n_t, 'pairs_exact': n_pe,
                     'pair_exact_acc': n_pe / max(n_t, 1),
                     'mean_cell_acc': sum(cells_c)/max(len(cells_c), 1),
                     'tasks_total': tt, 'tasks_solved': ts,
-                    'task_acc': ts / max(tt, 1), 'dsl_solved_pairs': n_dsl_solved}
+                    'task_acc': ts / max(tt, 1), 'method_counts': method_counts}
 
-        print('=== ARC-AGI-1 hybrid ===')
-        results['arc1_hybrid'] = eval_arc_hybrid(ARC1_ROOT, 'ARC-1', max_dsl_depth=3)
+        print('=== ARC-AGI-1 MCTS hybrid ===')
+        results['arc1_hybrid'] = eval_arc_mcts_hybrid(ARC1_ROOT, 'ARC-1', max_dsl_depth=3)
         print(_json.dumps(results['arc1_hybrid'], indent=2))
-        print('=== ARC-AGI-2 hybrid ===')
-        results['arc2_hybrid'] = eval_arc_hybrid(ARC2_ROOT, 'ARC-2', max_dsl_depth=3)
+        print('=== ARC-AGI-2 MCTS hybrid ===')
+        results['arc2_hybrid'] = eval_arc_mcts_hybrid(ARC2_ROOT, 'ARC-2', max_dsl_depth=3)
         print(_json.dumps(results['arc2_hybrid'], indent=2))
 
         # Procedural quick eval (uses op_id=ARC_GENERIC and vision pathway for now;
