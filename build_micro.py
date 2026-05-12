@@ -126,24 +126,43 @@ def main() -> None:
         if not ARC1_DIR.exists():
             subprocess.check_call(['git','clone','--depth','1',
                 'https://github.com/fchollet/ARC-AGI.git', str(ARC1_DIR)])
+        # RE-ARC: repo ships only the GENERATOR. Run it to materialise
+        # re_arc/tasks/*.json (per-task list of {input, output} pairs).
+        # generate_dataset accepts n_examples per task; we use 50 for speed
+        # (50 x 400 ARC-1 tasks = 20k augmented pairs total).
         if not REARC_DIR.exists():
             subprocess.check_call(['git','clone','--depth','1',
                 'https://github.com/michaelhodel/re-arc.git', str(REARC_DIR)])
-        # ARC-GEN (Google, arxiv:2511.00162): 100k procedural ARC examples
+        REARC_TASKS_DIR = REARC_DIR / 're_arc' / 'tasks'
+        if not REARC_TASKS_DIR.exists() or not any(REARC_TASKS_DIR.glob('*.json')):
+            print('RE-ARC: running generator (may take a few minutes)...')
+            try:
+                gen_code = (
+                    "import sys, os; sys.path.insert(0, %r); "
+                    "os.chdir(%r); "
+                    "from main import generate_dataset; "
+                    "generate_dataset(n_examples=50, diff_lb=0, diff_ub=1)"
+                    % (str(REARC_DIR), str(REARC_DIR))
+                )
+                subprocess.check_call(['python', '-c', gen_code], timeout=900)
+            except Exception as e:
+                print(f'RE-ARC generation failed (will run without): {e}')
+        # ARC-GEN (Google, arxiv:2511.00162): generator only, no shipped JSON.
+        # Generating 100 pairs x 400 tasks = ~40k examples takes too long in
+        # a Colab session; we generate a small subset (5 pairs x 50 tasks)
+        # purely as additional diversity. Drop if too slow.
         if not ARCGEN_DIR.exists():
             try:
                 subprocess.check_call(['git','clone','--depth','1',
                     'https://github.com/google/ARC-GEN.git', str(ARCGEN_DIR)])
             except Exception as e:
                 print(f'ARC-GEN clone failed (will run without): {e}')
-        # Enigmata (Bytedance/Tsinghua, arxiv:2505.19914): 36 puzzle tasks
+        # Enigmata sparse checkout often misses the actual data folder.
+        # Switch to full clone (small repo, ~few MB).
         if not ENIGMATA_DIR.exists():
             try:
-                subprocess.check_call(['git','clone','--depth','1','--filter=blob:none','--sparse',
+                subprocess.check_call(['git','clone','--depth','1',
                     'https://github.com/BytedTsinghua-SIA/Enigmata.git', str(ENIGMATA_DIR)])
-                # sparse checkout: grid + arithmetic + logic puzzles only
-                subprocess.check_call(['git','-C',str(ENIGMATA_DIR),'sparse-checkout','set',
-                    'data', 'puzzles', 'tasks'])
             except Exception as e:
                 print(f'Enigmata clone failed (will run without): {e}')
         # ConceptARC + Mini-ARC: pulled via neoneye collection (sparse, only what we need)
@@ -433,28 +452,29 @@ def main() -> None:
         # arc_mask_default is FLOAT in [0, 1]. 1.0 = pure vision pathway,
         # 0.0 = pure math pathway, 0.5 = blend both (geometry / hybrid).
         # The lambda may also override arc_mask via 4th return slot.
+        # v40.6 mix: weights biased toward sources that ALWAYS work (procedural
+        # generators + curated ARC-1/2). Best-effort sources (RE-ARC needs
+        # in-Colab generation; ARC-GEN, BARC, H-ARC, Enigmata may be empty
+        # depending on clone success) get smaller weights and fall through to
+        # sample_one retry if empty.
         MIX_WEIGHTS = [
-            # (name, weight, arc_mask_default, op_id, fn -> (pair, op_override, program, mask_override))
-            ('ARC-1',     0.20, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC1_FILES), None, None, None)),
-            ('RE-ARC',    0.16, 1.0, OP_ID["ARC_RE"],      lambda: (sample_arc(REARC_FILES), None, None, None)),
-            ('ARC-GEN',   0.10, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARCGEN_FILES), None, None, None)),
-            ('ARC-2',     0.12, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC2_FILES), None, None, None)),
+            # always-available curated ARC
+            ('ARC-1',     0.22, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC1_FILES), None, None, None)),
+            ('ARC-2',     0.14, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC2_FILES), None, None, None)),
             ('Concept',   0.04, 1.0, OP_ID["ARC_CONCEPT"], lambda: (sample_arc(CONCEPT_FILES), None, None, None)),
             ('Mini',      0.02, 1.0, OP_ID["ARC_MINI"],    lambda: (sample_arc(MINI_FILES), None, None, None)),
             ('Heavy',     0.04, 1.0, OP_ID["ARC_HEAVY"],   lambda: (sample_arc(HEAVY_FILES), None, None, None)),
-            # BARC HF (v40.5 fixed source): synthetic from GPT, vision pathway
-            ('BARC',      0.04, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(BARC_FILES), None, None, None)),
-            # arc-dataset-tama: big ARC-format synthetic pool (v40.5 add)
             ('Tama',      0.04, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(TAMA_FILES), None, None, None)),
-            # Math-v2: per-op arc_mask decided inside (0.0 pure / 0.5 spatial)
-            ('Math-v2',   0.10, 0.0, None,                  _math_v2_with_op),
-            ('Enigmata',  0.06, 0.5, ENIGMATA_OP_ID,        lambda: (sample_arc(ENIGMATA_FILES), None, None, None)),
-            # Sudoku: 9x9 with 3x3 sub-grid constraint = spatial structure -> hybrid
-            ('Sudoku',    0.04, 0.5, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None, None, None)),
+            # generated / external (may be empty -> sample_one falls through)
+            ('RE-ARC',    0.16, 1.0, OP_ID["ARC_RE"],      lambda: (sample_arc(REARC_FILES), None, None, None)),
+            ('ARC-GEN',   0.04, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARCGEN_FILES), None, None, None)),
+            ('BARC',      0.02, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(BARC_FILES), None, None, None)),
+            ('Enigmata',  0.04, 0.5, ENIGMATA_OP_ID,        lambda: (sample_arc(ENIGMATA_FILES), None, None, None)),
+            # always-available procedural
+            ('Math-v2',   0.12, 0.0, None,                  _math_v2_with_op),
+            ('Sudoku',    0.06, 0.5, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None, None, None)),
             ('CA',        0.04, 0.5, None,                  _ca_with_op),
             ('Compose',   0.02, 0.5, OP_ID["DSL_COMPOSE"],  _compose_with_program),
-            # H-ARC (v40.5 fixed URL): human traces, vision pathway
-            ('H-ARC',     0.02, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(HARC_FILES), None, None, None)),
         ]
         _cum = []
         s = 0.0
@@ -505,29 +525,32 @@ def main() -> None:
             (g, out), _prog = _gen_dsl_compose_with_program()
             return g, out
 
-        def sample_one():
+        def sample_one(_retry=0):
+            # Bounded retry: if a chosen slot is empty (file list empty),
+            # try a different one. Cap recursion at len(MIX_WEIGHTS) + 4.
+            if _retry > len(MIX_WEIGHTS) + 4:
+                # final fallback: always-available math procedural
+                pair = gen_math_pair_v2(side=min(GRID, 16), rng=rng)
+                return pair, 0.0, OP_ID["MATH_ADD"], None
             r = rng.random() * TOTAL_W
             for thresh, name, arc_mask_d, op_default, fn in _cum:
                 if r < thresh:
-                    result = fn()
-                    # tuple length varies: 3 (legacy) or 4 (v40.4 with mask override)
+                    try:
+                        result = fn()
+                    except Exception:
+                        return sample_one(_retry=_retry + 1)
                     if len(result) == 4:
                         pair, op_override, program, mask_override = result
                     else:
                         pair, op_override, program = result
                         mask_override = None
                     if pair is None:
-                        return sample_one()
+                        return sample_one(_retry=_retry + 1)
                     op_id = op_override if op_override is not None else op_default
                     arc_mask_v = mask_override if mask_override is not None else arc_mask_d
                     return pair, float(arc_mask_v), op_id, program
-            # fallback (should not trigger)
-            result = _cum[-1][4]()
-            if len(result) == 4:
-                pair, op_override, program, mask_override = result
-            else:
-                pair, op_override, program = result; mask_override = None
-            return pair, float(_cum[-1][2]), _cum[-1][3], program
+            # final-tail fallback
+            return sample_one(_retry=_retry + 1)
 
         # NULL_PROGRAM index for CodeHead targets; matches code_head.null_class.
         N_DSL_PRIMS_HOST = 146
@@ -689,7 +712,10 @@ def main() -> None:
         print(f'\\nphase A (supervised) done in {(time.time()-t0)/60:.1f}min')
 
         # ============= Phase B: GRPO RL =============
-        print(f'\\n=== Phase B: GRPO RL ({GRPO_STEPS} steps, group=4) ===')
+        # Reset URM to full depth (CGAR PDC ends at A2 with full depth, but be
+        # explicit so any subsequent eval path doesn't inherit a shrunken state).
+        urm.set_n_loops_eff(N_LOOPS)
+        print(f'\\n=== Phase B: GRPO RL ({GRPO_STEPS} steps, group=4, full depth) ===')
 
         # Adapter for GRPO API. For RL phase, the GRPO step does not have a
         # per-sample op_id signal, so we default everything to ARC_GENERIC (id 0)
