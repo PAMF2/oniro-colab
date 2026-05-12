@@ -185,10 +185,14 @@ class URM(nn.Module):
         global_cycle = 0
         for block in self.blocks:
             kv_cache = {"valid": False}
-            group_start = global_cycle
-            group_end = global_cycle + self.group_loops
             for c in range(self.group_loops):
                 if c % self.kv_refresh_every == 0:
+                    kv_cache = {"valid": False}
+                # Invalidate cache at no_grad/grad boundary so the first grad
+                # cycle recomputes K,V with a grad-tracked path (otherwise
+                # cached K,V are detached and the first grad cycle would lose
+                # K,V gradient flow until the next scheduled refresh).
+                if global_cycle == self.n_forward_only:
                     kv_cache = {"valid": False}
                 if global_cycle < self.n_forward_only:
                     with torch.no_grad():

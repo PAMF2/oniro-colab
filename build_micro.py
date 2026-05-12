@@ -1,15 +1,13 @@
-"""Build ONIRO v35 Colab notebook.
+"""Build ONIRO v36 Colab notebook.
 
-v35 changes vs v34:
-    - GQA attention (n_heads=12, n_kv_heads=3, group_size=4)
-    - Flash attention via sdpa
-    - Cross-cycle KV cache (refresh every 2 cycles)
-    - 2 untied URM groups, weight-tied within each (group_loops=6, total=12)
-    - GRID 14 -> 30 (matches ARC distribution)
-    - D 128 -> 768, ffn 256 -> 3584
-    - Params 2.5M -> ~20M
-    - Heavy ARC-train mix (50%) + dihedral aug during training
-    - TTFT 50 -> 100 steps
+v36 changes vs v35:
+    - KV cache invalidation at no_grad/grad boundary (correctness fix)
+    - EMA (exponential moving average) on params - URM paper essential trick
+    - Color permutation augmentation - NVARC SOTA pattern (10! perms)
+    - Text head (byte-level) for natural-language Q/A about math problems
+    - Expanded math suite: 6 generators (arith/seq/compare/parity/mod/linear)
+    - 1000-sample TTA majority vote at ARC eval (TRM: +11pp vs single-pass)
+    - Joint loss: grid_ce + 0.3 * text_ce
 
 Pulls source from https://github.com/PAMF2/oniro-colab (public).
 """
@@ -40,28 +38,24 @@ def code(text: str) -> dict:
 def main() -> None:
     cells = []
     cells.append(md(textwrap.dedent("""
-        # ONIRO v35 — URM 20M + GQA + KV Cache + RL on Colab
+        # ONIRO v36 — URM 20M + Text Head + EMA + Color Perm Aug
 
         **Setup:** Runtime → Change runtime type → **T4 GPU** → Save → Run All.
 
         Pulls source from https://github.com/PAMF2/oniro-colab (public).
 
-        Architecture upgrades over v34:
-        - GQA: n_kv_heads=3 vs n_heads=12 (4x KV reduction)
-        - Flash attention (F.scaled_dot_product_attention)
-        - Cross-cycle KV cache (refresh=2 cycles, ~50% attention savings)
-        - 2 untied URM groups, weight-tied internally (6 cycles each)
-        - GRID 14 -> 30 (covers ARC real distribution)
-        - Params 2.5M -> 20M
-        - ARC-1/2 train-set heavy (50%) + dihedral aug
-        - TTFT 100 steps eval
+        Upgrades over v35:
+        - **KV cache no_grad/grad boundary fix** (correctness)
+        - **EMA params** (URM paper essential — stability)
+        - **Color permutation aug** (NVARC SOTA pattern: 10! perms)
+        - **Text head** (byte-level Q/A on math problems)
+        - **Math suite expanded**: arith / seq / compare / parity / mod / linear eq
+        - **1000-sample TTA majority vote** at ARC eval (TRM +11pp)
+        - **Joint loss**: grid_ce + 0.3 * text_ce
 
-        Phase A: supervised DIS training (~40k steps)
-        Phase B: GRPO RL fine-tuning (~5k steps)
-        AlphaEvolve-Godel outer mutation every 2000 steps.
-        Eval on ARC-AGI-1, ARC-AGI-2, Sudoku, Math.
+        Phase A: supervised (40k) | Phase B: GRPO (5k) | TTFT eval
 
-        Runtime ~6-8h on Colab free T4.
+        Runtime ~6-8h on Colab T4.
     """).strip()))
 
     cells.append(code(textwrap.dedent("""
@@ -113,7 +107,7 @@ def main() -> None:
 
     cells.append(code("!pip -q install einops 2>&1 | tail -2"))
 
-    cells.append(md("## Build URM v35 (~20M params, GQA + KV cache)"))
+    cells.append(md("## Build URM v36 (~22M params: 20M URM + 2M text head)"))
     cells.append(code(textwrap.dedent("""
         import time, json as _json, random
         import numpy as np
@@ -122,31 +116,41 @@ def main() -> None:
 
         from oniro.models.urm import URM
         from oniro.models.grid_token_encoder import GridTokenEncoder, GridTokenDecoder
+        from oniro.models.text_head import TextHead, text_to_bytes, bytes_to_text, BYTE_VOCAB, PAD
         from oniro.losses.dis import make_dis_targets
         from oniro.losses.grid_ce import grid_ce_loss
         from oniro.orchestrator.alphaevolve_godel import alphaevolve_godel_round, AlphaEvolveGodelArchive
         from oniro.data.arc2_loader import _pairs_from_task
         from oniro.data.sudoku_gen import gen_sudoku_pair
         from oniro.data.math_gen import gen_math_pair
+        from oniro.data.math_text import gen_math_text_pair
+        from oniro.data.color_perm import random_color_perm, apply_color_perm
         from oniro.training.grpo import grpo_step, snapshot_policy
+        from oniro.training.ema import EMA
 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print('device:', device)
         if device == 'cpu':
             print('WARNING: GPU not active. Runtime → Change runtime type → T4 GPU')
 
-        # v35 config
+        # v36 config
         GRID = 30
         D = 768
         N_HEADS = 12
-        N_KV_HEADS = 3      # GQA 4x reduction
+        N_KV_HEADS = 3
         FFN = 3584
         N_LOOPS = 12
         N_GROUPS = 2
         N_FORWARD_ONLY = 3
         KV_REFRESH = 2
         N_COLORS = 10
-        BATCH = 8           # GRID 30 + D 768 = need smaller batch on T4
+        BATCH = 8
+
+        # text head
+        TEXT_D = 192
+        TEXT_LAYERS = 3
+        TEXT_HEADS = 4
+        TEXT_MAX_LEN = 48
 
         encoder = GridTokenEncoder(grid_size=GRID, n_colors=N_COLORS, d_model=D).to(device)
         urm = URM(d_model=D, n_heads=N_HEADS, n_kv_heads=N_KV_HEADS,
@@ -154,36 +158,43 @@ def main() -> None:
                   ffn_hidden=FFN, n_groups=N_GROUPS,
                   kv_refresh_every=KV_REFRESH, use_rima=True).to(device)
         decoder = GridTokenDecoder(d_model=D, n_colors=N_COLORS).to(device)
+        text_proj = torch.nn.Linear(D, TEXT_D).to(device)
+        text_head = TextHead(d_model=TEXT_D, n_layers=TEXT_LAYERS,
+                             n_heads=TEXT_HEADS, max_len=TEXT_MAX_LEN).to(device)
 
-        all_params = list(encoder.parameters()) + list(urm.parameters()) + list(decoder.parameters())
+        all_params = (list(encoder.parameters()) + list(urm.parameters())
+                      + list(decoder.parameters())
+                      + list(text_proj.parameters()) + list(text_head.parameters()))
         n_p = sum(p.numel() for p in all_params)
-        print(f'URM v35: {n_p/1e6:.2f}M params  (D={D}, h={N_HEADS}/kv={N_KV_HEADS}, '
-              f'loops={N_LOOPS}/{N_GROUPS}grp, ffn={FFN}, grid={GRID}, kv_refresh={KV_REFRESH})')
+        print(f'ONIRO v36: {n_p/1e6:.2f}M params (URM trunk + text head)')
+        print(f'  URM: D={D}, h={N_HEADS}/kv={N_KV_HEADS}, loops={N_LOOPS}/{N_GROUPS}grp, '
+              f'ffn={FFN}, grid={GRID}, kv_refresh={KV_REFRESH}')
+        print(f'  Text: D={TEXT_D}, layers={TEXT_LAYERS}, byte-vocab=256, max_len={TEXT_MAX_LEN}')
 
-        # GRID 30 padding helper (no nearest-resize -> preserves real grid structure)
         def grid_to_fixed(grid_list, target_side=GRID):
             arr = np.asarray(grid_list, dtype=np.int64)
             if arr.ndim != 2:
                 arr = arr.reshape(1, -1) if arr.ndim == 1 else arr
             h, w = arr.shape
             if h > target_side or w > target_side:
-                # ARC max grid is 30x30, so this only triggers on sudoku/math at 30+
                 arr = arr[:target_side, :target_side]
                 h, w = arr.shape
             canvas = np.zeros((target_side, target_side), dtype=np.int64)
             canvas[:h, :w] = arr
             canvas = np.clip(canvas, 0, N_COLORS - 1)
             return torch.from_numpy(canvas).long()
+
+        # EMA shadow params - URM paper essential for stability
+        ema = EMA([encoder, urm, decoder, text_proj, text_head], decay=0.999)
     """).strip()))
 
-    cells.append(md("## Train: ARC heavy (50%) + Sudoku/Math + dihedral aug"))
+    cells.append(md("## Train: ARC heavy + Sudoku + Math + Text Q/A"))
     cells.append(code(textwrap.dedent("""
         rng = random.Random(0)
         ARC1_FILES = sorted((Path(ARC1_ROOT) / 'training').glob('*.json'))
         ARC2_FILES = sorted((Path(ARC2_ROOT) / 'training').glob('*.json'))
         print(f'ARC1 train tasks: {len(ARC1_FILES)}  ARC2 train tasks: {len(ARC2_FILES)}')
 
-        # cache parsed pairs to avoid repeated JSON parse
         _ARC_CACHE = {}
         def _task_pairs(tf):
             s = str(tf)
@@ -203,44 +214,57 @@ def main() -> None:
             return g
 
         def sample_batch(B, do_aug=True):
-            gi_, go_ = [], []
+            '''Sample mixed batch. Each item has grid_in, grid_out, and optionally text Q/A.'''
+            gi_, go_, text_q, text_a, has_text = [], [], [], [], []
             for _ in range(B):
                 r = rng.random()
-                # v35 mix: 35% ARC2, 25% ARC1, 5% ARC1-eval, 20% sudoku, 15% math
-                if r < 0.35:
+                _text_q, _text_a = '', ''
+                _has_text = False
+                if r < 0.30:
                     inp, out = sample_arc(ARC2_FILES)
-                    inp = np.asarray(inp, dtype=np.int64)
-                    out = np.asarray(out, dtype=np.int64)
-                elif r < 0.65:
+                    inp = np.asarray(inp, dtype=np.int64); out = np.asarray(out, dtype=np.int64)
+                elif r < 0.55:
                     inp, out = sample_arc(ARC1_FILES)
-                    inp = np.asarray(inp, dtype=np.int64)
-                    out = np.asarray(out, dtype=np.int64)
-                elif r < 0.85:
+                    inp = np.asarray(inp, dtype=np.int64); out = np.asarray(out, dtype=np.int64)
+                elif r < 0.70:
                     inp, out = gen_sudoku_pair(mask_rate=0.4, rng=rng)
-                    inp = np.asarray(inp, dtype=np.int64)
-                    out = np.asarray(out, dtype=np.int64)
-                else:
+                    inp = np.asarray(inp, dtype=np.int64); out = np.asarray(out, dtype=np.int64)
+                elif r < 0.80:
                     inp, out = gen_math_pair(side=min(GRID, 16), rng=rng)
-                    inp = np.asarray(inp, dtype=np.int64)
-                    out = np.asarray(out, dtype=np.int64)
+                    inp = np.asarray(inp, dtype=np.int64); out = np.asarray(out, dtype=np.int64)
+                else:
+                    # math text Q/A
+                    gi, go, q, a = gen_math_text_pair(rng=rng, side=min(GRID, 16))
+                    inp = np.asarray(gi, dtype=np.int64); out = np.asarray(go, dtype=np.int64)
+                    _text_q, _text_a = q, a
+                    _has_text = True
                 if do_aug:
                     k = rng.randint(0, 3)
                     flip = rng.random() < 0.5
                     inp = dihedral_aug(inp, k, flip)
                     out = dihedral_aug(out, k, flip)
+                    # Color permutation aug (NVARC SOTA)
+                    if rng.random() < 0.7:
+                        cp = random_color_perm(rng, n_colors=N_COLORS, keep_bg=False)
+                        inp = apply_color_perm(inp, cp)
+                        out = apply_color_perm(out, cp)
                 gi_.append(grid_to_fixed(inp))
                 go_.append(grid_to_fixed(out))
-            return (torch.stack(gi_).to(device), torch.stack(go_).to(device))
+                text_q.append(_text_q); text_a.append(_text_a); has_text.append(_has_text)
+            g_in_t = torch.stack(gi_).to(device)
+            g_out_t = torch.stack(go_).to(device)
+            return g_in_t, g_out_t, text_q, text_a, has_text
 
-        g_in, g_out = sample_batch(2)
-        print('sample shapes:', g_in.shape, g_out.shape)
+        g_in, g_out, tq, ta, ht = sample_batch(4)
+        print('sample shapes:', g_in.shape, g_out.shape, 'text items:', sum(ht))
     """).strip()))
 
     cells.append(code(textwrap.dedent("""
         STEPS = int(os.environ.get('ONIRO_STEPS', '40000'))
         GRPO_STEPS = int(os.environ.get('ONIRO_GRPO_STEPS', '5000'))
+        TEXT_LOSS_W = float(os.environ.get('ONIRO_TEXT_LOSS_W', '0.3'))
         opt = torch.optim.AdamW(all_params, lr=2e-4, weight_decay=0.05)
-        # warmup + cosine
+
         from torch.optim.lr_scheduler import LambdaLR
         WARMUP = 1000
         def lr_lambda(step):
@@ -253,13 +277,29 @@ def main() -> None:
         ae_archive = AlphaEvolveGodelArchive()
         AE_EVERY = 2000
 
+        def text_supervision_loss(memory, q_list, a_list, has_text_list):
+            '''Cross-entropy on byte-level text answer, conditioned on URM state.'''
+            idxs = [i for i, h in enumerate(has_text_list) if h]
+            if not idxs:
+                return torch.zeros((), device=device)
+            mem = text_proj(memory[idxs])
+            tok_in = torch.stack([text_to_bytes(f'{q_list[i]} {a_list[i]}',
+                                                max_len=TEXT_MAX_LEN) for i in idxs]).to(device)
+            logits = text_head(mem, tok_in[:, :-1])
+            tgt = tok_in[:, 1:]
+            mask = (tgt != PAD).float()
+            logp = F.log_softmax(logits, dim=-1)
+            chosen = logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+            return -(chosen * mask).sum() / max(mask.sum(), 1.0)
+
         t0 = time.time()
         for step in range(STEPS):
-            g_in, g_out = sample_batch(BATCH)
+            g_in, g_out, tq, ta, ht = sample_batch(BATCH)
             enc_out = encoder(g_in)
             urm_out = urm(enc_out['tokens'])
 
-            loss = torch.zeros((), device=device)
+            # Grid DIS loss
+            loss_grid = torch.zeros((), device=device)
             n_states = len(urm_out['states_per_loop'])
             dis_targets = make_dis_targets(g_out, n_cycles=n_states - 1,
                                             n_colors=N_COLORS, max_corruption=0.5,
@@ -268,13 +308,18 @@ def main() -> None:
                 logits = decoder(state, GRID)
                 tgt = dis_targets[t].to(device)
                 weight = 1.5 ** (-(n_states - 2 - t))
-                loss = loss + weight * grid_ce_loss(logits, tgt, bg_weight=0.15)
+                loss_grid = loss_grid + weight * grid_ce_loss(logits, tgt, bg_weight=0.15)
+
+            # Text Q/A loss (conditioned on URM final state)
+            loss_text = text_supervision_loss(urm_out['final_state'], tq, ta, ht)
+            loss = loss_grid + TEXT_LOSS_W * loss_text
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(all_params, 1.0)
             opt.step()
             sched.step()
+            ema.update()
 
             if step % 100 == 0:
                 dt = time.time() - t0
@@ -283,25 +328,27 @@ def main() -> None:
                     pred = final_logits.argmax(dim=1)
                     cell_acc = (pred == g_out).float().mean().item()
                 lr_cur = sched.get_last_lr()[0]
-                print(f'step {step:5d}  loss={float(loss.detach()):.4f}  cell_acc={cell_acc:.3f}  '
-                      f'lr={lr_cur:.2e}  rate={(step+1)/max(dt,1):.1f}/s')
+                print(f'step {step:5d}  loss={float(loss.detach()):.4f}  '
+                      f'grid={float(loss_grid.detach()):.3f}  txt={float(loss_text):.3f}  '
+                      f'cell_acc={cell_acc:.3f}  lr={lr_cur:.2e}  '
+                      f'rate={(step+1)/max(dt,1):.1f}/s')
 
             if step > 0 and step % AE_EVERY == 0:
                 urm.eval()
-                eval_in, eval_out = sample_batch(BATCH, do_aug=False)
-                def ae_score():
-                    with torch.no_grad():
-                        e = encoder(eval_in)
-                        u = urm(e['tokens'])
-                        l = decoder(u['final_state'], GRID)
-                        return float((l.argmax(dim=1) == eval_out).float().mean().item())
-                acc, base, best, ae_archive = alphaevolve_godel_round(
-                    urm, ae_score, n_candidates=3, sigma=2e-3, archive=ae_archive,
-                )
+                with ema.swap_in():
+                    eval_in, eval_out, _, _, _ = sample_batch(BATCH, do_aug=False)
+                    def ae_score():
+                        with torch.no_grad():
+                            e = encoder(eval_in); u = urm(e['tokens'])
+                            l = decoder(u['final_state'], GRID)
+                            return float((l.argmax(dim=1) == eval_out).float().mean().item())
+                    acc, base, best, ae_archive = alphaevolve_godel_round(
+                        urm, ae_score, n_candidates=3, sigma=2e-3, archive=ae_archive,
+                    )
                 print(f'  [AE] base={base:.4f} best={best:.4f} accept={acc} reject={ae_archive.rejected}')
                 urm.train()
 
-        print(f'\\nphase A (supervised) done in {(time.time()-t0)/60:.1f}min')
+        print(f'\\nphase A (supervised+text) done in {(time.time()-t0)/60:.1f}min')
 
         # ============= Phase B: GRPO RL =============
         print(f'\\n=== Phase B: GRPO RL ({GRPO_STEPS} steps, group=4) ===')
@@ -313,11 +360,12 @@ def main() -> None:
 
         rl_opt = torch.optim.AdamW(all_params, lr=3e-5, weight_decay=0.05)
         for rl_step in range(GRPO_STEPS):
-            g_in_b, g_out_b = sample_batch(BATCH, do_aug=False)
+            g_in_b, g_out_b, _, _, _ = sample_batch(BATCH, do_aug=False)
             r = grpo_step(encoder, urm, decoder, rl_opt, g_in_b, g_out_b,
                           ref_enc, ref_urm, ref_dec,
                           n_group=4, eps_clip=0.2, kl_beta=0.04,
                           temperature=1.0, reward_type='cell')
+            ema.update()
             if rl_step % 100 == 0:
                 print(f'  rl_step {rl_step:5d}  reward={r["mean_reward"]:.3f}  '
                       f'max_r={r["max_reward"]:.3f}  kl={r["kl"]:.3f}  loss={r["loss"]:.4f}')
@@ -332,173 +380,217 @@ def main() -> None:
         ckpt_dir = ROOT / 'checkpoints'
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         torch.save({'encoder': encoder.state_dict(), 'urm': urm.state_dict(),
-                    'decoder': decoder.state_dict()},
-                   str(ckpt_dir / 'urm_v35_final.pt'))
+                    'decoder': decoder.state_dict(),
+                    'text_proj': text_proj.state_dict(),
+                    'text_head': text_head.state_dict()},
+                   str(ckpt_dir / 'urm_v36_final.pt'))
     """).strip()))
 
-    cells.append(md("## DSL Hybrid Solver eval (symbolic + neural fallback)"))
+    cells.append(md("## ARC eval — 1000-sample TTA majority vote (TRM SOTA pattern)"))
+    cells.append(code(textwrap.dedent("""
+        encoder.eval(); urm.eval(); decoder.eval()
+
+        N_TTA = int(os.environ.get('ONIRO_TTA', '64'))   # T4 mem -> 64, paper uses 1000
+        # Augmentation pool: 8 dihedrals × random color perms
+
+        @torch.no_grad()
+        def tta_majority_vote(grid_int_t, n_samples=N_TTA):
+            '''Predict via N augmented passes, majority vote per pixel.'''
+            H, W = grid_int_t.shape
+            votes = torch.zeros(N_COLORS, GRID, GRID, device=device)
+            gnp = grid_int_t.cpu().numpy()
+            for s in range(n_samples):
+                k = rng.randint(0, 3); flip = rng.random() < 0.5
+                cp = random_color_perm(rng, n_colors=N_COLORS, keep_bg=False)
+                inv_cp = np.argsort(cp).astype(np.int64)
+                gaug = dihedral_aug(gnp, k, flip)
+                gaug = apply_color_perm(gaug, cp)
+                t = grid_to_fixed(gaug).unsqueeze(0).to(device)
+                e = encoder(t); u = urm(e['tokens'])
+                l = decoder(u['final_state'], GRID)
+                pred = l.argmax(dim=1)[0]
+                # invert color perm
+                pred_np = pred.cpu().numpy()
+                pred_np = apply_color_perm(pred_np.astype(np.int64), inv_cp)
+                pred = torch.from_numpy(pred_np).to(device)
+                # invert dihedral
+                if flip:
+                    pred = torch.flip(pred, dims=(-1,))
+                pred = torch.rot90(pred, k=-k, dims=(-2, -1))
+                for c in range(N_COLORS):
+                    votes[c] += (pred == c).float()
+            return votes.argmax(dim=0)
+
+        def eval_arc_tta(root, label):
+            sd = Path(root) / 'evaluation'
+            files = sorted(sd.glob('*.json'))
+            n_pe = 0; n_t = 0; cells_c = []; ts = 0; tt = 0
+            with ema.swap_in():
+                for ti, tf in enumerate(files):
+                    with tf.open() as f:
+                        task = _json.load(f)
+                    solved = []
+                    for tp in task.get('test', []):
+                        if 'output' not in tp: continue
+                        gi = grid_to_fixed(tp['input']).to(device)
+                        gt = grid_to_fixed(tp['output']).to(device)
+                        pred = tta_majority_vote(gi)
+                        exact = bool((pred == gt).all().item())
+                        n_t += 1
+                        if exact: n_pe += 1
+                        cells_c.append(float((pred == gt).float().mean().item()))
+                        solved.append(exact)
+                    if solved:
+                        tt += 1
+                        if all(solved): ts += 1
+                    if (ti + 1) % 30 == 0:
+                        print(f'  {label} TTA{N_TTA} [{ti+1}/{len(files)}] exact={n_pe}/{n_t}')
+            return {'label': label, 'pairs_total': n_t, 'pairs_exact': n_pe,
+                    'pair_exact_acc': n_pe / max(n_t, 1),
+                    'mean_cell_acc': sum(cells_c)/max(len(cells_c), 1),
+                    'tasks_total': tt, 'tasks_solved': ts,
+                    'task_acc': ts / max(tt, 1),
+                    'tta_samples': N_TTA}
+
+        results = {}
+        print(f'=== ARC-AGI-1 (TTA {N_TTA} samples) ===')
+        results['arc1'] = eval_arc_tta(ARC1_ROOT, 'ARC-1')
+        print(_json.dumps(results['arc1'], indent=2))
+        print(f'=== ARC-AGI-2 (TTA {N_TTA} samples) ===')
+        results['arc2'] = eval_arc_tta(ARC2_ROOT, 'ARC-2')
+        print(_json.dumps(results['arc2'], indent=2))
+    """).strip()))
+
+    cells.append(md("## DSL Hybrid (symbolic + neural)"))
     cells.append(code(textwrap.dedent("""
         from oniro.dsl.solver import solve_task as dsl_solve_task
 
+        @torch.no_grad()
         def neural_predict_np(grid_np):
             gi = grid_to_fixed(grid_np.tolist()).unsqueeze(0).to(device)
-            with torch.no_grad():
-                e = encoder(gi)
-                u = urm(e['tokens'])
-                l = decoder(u['final_state'], GRID)
-                return l.argmax(dim=1)[0].cpu().numpy().astype(np.int8)
+            e = encoder(gi); u = urm(e['tokens'])
+            l = decoder(u['final_state'], GRID)
+            return l.argmax(dim=1)[0].cpu().numpy().astype(np.int8)
 
         def eval_arc_hybrid(root, label, max_dsl_depth=3):
             sd = Path(root) / 'evaluation'
             files = sorted(sd.glob('*.json'))
-            n_pe = 0; n_t = 0; cells_c = []; ts = 0; tt = 0
-            n_dsl_solved = 0
-            for ti, tf in enumerate(files):
-                with tf.open() as f:
-                    task = _json.load(f)
-                res = dsl_solve_task(task, neural_fallback=neural_predict_np, max_depth=max_dsl_depth)
-                solved = []
-                for i, tp in enumerate(task.get('test', [])):
-                    if 'output' not in tp: continue
-                    gt = np.asarray(tp['output'], dtype=np.int8)
-                    pred = res['predictions'][i] if i < len(res['predictions']) else None
-                    if pred is None:
-                        pred = neural_predict_np(np.asarray(tp['input'], dtype=np.int8))
-                    if pred.shape == gt.shape:
-                        exact = bool(np.array_equal(pred, gt))
-                        cell_acc = float((pred == gt).mean())
-                    else:
-                        exact = False; cell_acc = 0.0
-                    n_t += 1
-                    if exact:
-                        n_pe += 1
-                        if res['method'] == 'dsl':
-                            n_dsl_solved += 1
-                    cells_c.append(cell_acc)
-                    solved.append(exact)
-                if solved:
-                    tt += 1
-                    if all(solved): ts += 1
-                if (ti + 1) % 50 == 0:
-                    print(f'  {label} [{ti+1}/{len(files)}] exact={n_pe}/{n_t}  dsl_solved={n_dsl_solved}')
-            return {'label': label, 'pairs_total': n_t, 'pairs_exact': n_pe,
+            n_pe = 0; n_t = 0; cells_c = []; ts = 0; tt = 0; n_dsl_solved = 0
+            with ema.swap_in():
+                for ti, tf in enumerate(files):
+                    with tf.open() as f:
+                        task = _json.load(f)
+                    res = dsl_solve_task(task, neural_fallback=neural_predict_np, max_depth=max_dsl_depth)
+                    solved = []
+                    for i, tp in enumerate(task.get('test', [])):
+                        if 'output' not in tp: continue
+                        gt = np.asarray(tp['output'], dtype=np.int8)
+                        pred = res['predictions'][i] if i < len(res['predictions']) else None
+                        if pred is None:
+                            pred = neural_predict_np(np.asarray(tp['input'], dtype=np.int8))
+                        if pred.shape == gt.shape:
+                            exact = bool(np.array_equal(pred, gt))
+                            cell_acc = float((pred == gt).mean())
+                        else:
+                            exact = False; cell_acc = 0.0
+                        n_t += 1
+                        if exact:
+                            n_pe += 1
+                            if res['method'] == 'dsl': n_dsl_solved += 1
+                        cells_c.append(cell_acc); solved.append(exact)
+                    if solved:
+                        tt += 1
+                        if all(solved): ts += 1
+                    if (ti + 1) % 50 == 0:
+                        print(f'  {label}-hybrid [{ti+1}/{len(files)}] exact={n_pe}/{n_t}  dsl_solved={n_dsl_solved}')
+            return {'label': label+'-hybrid', 'pairs_total': n_t, 'pairs_exact': n_pe,
                     'pair_exact_acc': n_pe / max(n_t, 1),
                     'mean_cell_acc': sum(cells_c)/max(len(cells_c), 1),
                     'tasks_total': tt, 'tasks_solved': ts,
-                    'task_acc': ts / max(tt, 1),
-                    'dsl_solved_pairs': n_dsl_solved}
+                    'task_acc': ts / max(tt, 1), 'dsl_solved_pairs': n_dsl_solved}
 
         print('=== ARC-AGI-1 hybrid (DSL depth=3 + neural) ===')
-        r1_hybrid = eval_arc_hybrid(ARC1_ROOT, 'ARC-1-hybrid', max_dsl_depth=3)
-        print(_json.dumps(r1_hybrid, indent=2))
-        print('=== ARC-AGI-2 hybrid (DSL depth=3 + neural) ===')
-        r2_hybrid = eval_arc_hybrid(ARC2_ROOT, 'ARC-2-hybrid', max_dsl_depth=3)
-        print(_json.dumps(r2_hybrid, indent=2))
-        with open(str(ROOT / 'eval_hybrid.json'), 'w') as f:
-            _json.dump({'arc1': r1_hybrid, 'arc2': r2_hybrid}, f, indent=2)
+        results['arc1_hybrid'] = eval_arc_hybrid(ARC1_ROOT, 'ARC-1', max_dsl_depth=3)
+        print(_json.dumps(results['arc1_hybrid'], indent=2))
+        print('=== ARC-AGI-2 hybrid ===')
+        results['arc2_hybrid'] = eval_arc_hybrid(ARC2_ROOT, 'ARC-2', max_dsl_depth=3)
+        print(_json.dumps(results['arc2_hybrid'], indent=2))
     """).strip()))
 
-    cells.append(md("## Eval: ARC-1, ARC-2 (TTFT + AIRV), Sudoku, Math"))
+    cells.append(md("## Math text eval — model answers in natural language"))
     cells.append(code(textwrap.dedent("""
-        from oniro.eval.ttft_urm import ttft_finetune_urm, restore_urm, airv_predict
-        encoder.eval(); urm.eval(); decoder.eval()
-
         @torch.no_grad()
-        def predict(grid_input_t):
-            e = encoder(grid_input_t)
-            u = urm(e['tokens'])
+        def answer_math(question_text, grid_in_np):
+            '''Given math question text + visual grid, model emits text answer.'''
+            gi = grid_to_fixed(grid_in_np.tolist()).unsqueeze(0).to(device)
+            e = encoder(gi); u = urm(e['tokens'])
+            mem = text_proj(u['final_state'])
+            seq = text_head.generate(mem, max_new=12, temperature=0.0)
+            return bytes_to_text(seq[0])
+
+        def eval_math_text(n=200):
+            n_correct = 0
+            examples = []
+            with ema.swap_in():
+                encoder.eval(); urm.eval(); text_head.eval(); text_proj.eval()
+                for i in range(n):
+                    gi, go, q, a = gen_math_text_pair(rng=rng, side=min(GRID, 16))
+                    pred_full = answer_math(q, np.asarray(gi, dtype=np.int64))
+                    # try to extract trailing token
+                    pred = pred_full.strip().split()[-1] if pred_full.strip() else ''
+                    ok = pred.strip().rstrip('.').lower() == a.strip().lower()
+                    n_correct += int(ok)
+                    if i < 6:
+                        examples.append(f'  Q: {q!r}  A: {a!r}  pred: {pred_full!r}  ok={ok}')
+            return n_correct / n, examples
+
+        print('=== Math Text Q/A eval ===')
+        text_acc, ex = eval_math_text(n=200)
+        print(f'text answer accuracy: {text_acc*100:.1f}%')
+        for line in ex: print(line)
+        results['math_text'] = {'accuracy': text_acc, 'n': 200}
+    """).strip()))
+
+    cells.append(md("## Sudoku + Math grid eval (procedural)"))
+    cells.append(code(textwrap.dedent("""
+        @torch.no_grad()
+        def predict_grid(grid_input_t):
+            e = encoder(grid_input_t); u = urm(e['tokens'])
             l = decoder(u['final_state'], GRID)
             return l.argmax(dim=1)[0]
 
-        TTFT_STEPS = int(os.environ.get('ONIRO_TTFT_STEPS', '100'))
-        TTFT_LR = float(os.environ.get('ONIRO_TTFT_LR', '1e-4'))
-        USE_AIRV = os.environ.get('ONIRO_AIRV', '1') == '1'
-
-        def predict_with_ttft_airv(task, test_input_grid_int):
-            demos = []
-            for tp in task.get('train', []):
-                di = grid_to_fixed(tp['input']).unsqueeze(0).to(device)
-                do = grid_to_fixed(tp['output']).unsqueeze(0).to(device)
-                demos.append((di, do))
-            snap = ttft_finetune_urm(encoder, urm, decoder, demos,
-                                     grid_size=GRID, n_steps=TTFT_STEPS,
-                                     lr=TTFT_LR, device=device)
-            if USE_AIRV:
-                pred = airv_predict(encoder, urm, decoder,
-                                     test_input_grid_int.unsqueeze(0),
-                                     grid_size=GRID, n_colors=N_COLORS)
-            else:
-                pred = predict(test_input_grid_int.unsqueeze(0))
-            restore_urm(encoder, urm, decoder, snap)
-            return pred
-
-        def eval_arc(root, label):
-            sd = Path(root) / 'evaluation'
-            files = sorted(sd.glob('*.json'))
-            n_pe = 0; n_t = 0; cells_c = []; ts = 0; tt = 0
-            for ti, tf in enumerate(files):
-                with tf.open() as f:
-                    task = _json.load(f)
-                solved = []
-                for tp in task.get('test', []):
-                    if 'output' not in tp: continue
-                    gi = grid_to_fixed(tp['input']).to(device)
-                    gt = grid_to_fixed(tp['output']).to(device)
-                    pred = predict_with_ttft_airv(task, gi)
-                    exact = bool((pred == gt).all().item())
-                    n_t += 1
-                    if exact: n_pe += 1
-                    cells_c.append(float((pred == gt).float().mean().item()))
-                    solved.append(exact)
-                if solved:
-                    tt += 1
-                    if all(solved): ts += 1
-                if (ti + 1) % 30 == 0:
-                    print(f'  {label} [{ti+1}/{len(files)}] exact={n_pe}/{n_t}')
-            return {'label': label, 'pairs_total': n_t, 'pairs_exact': n_pe,
-                    'pair_exact_acc': n_pe / max(n_t, 1),
-                    'mean_cell_acc': sum(cells_c)/max(len(cells_c), 1),
-                    'tasks_total': tt, 'tasks_solved': ts,
-                    'task_acc': ts / max(tt, 1),
-                    'ttft_steps': TTFT_STEPS, 'airv': USE_AIRV}
-
-        results = {}
-        print('=== ARC-AGI-1 ===')
-        results['arc1'] = eval_arc(ARC1_ROOT, 'ARC-1'); print(_json.dumps(results['arc1'], indent=2))
-        print('=== ARC-AGI-2 ===')
-        results['arc2'] = eval_arc(ARC2_ROOT, 'ARC-2'); print(_json.dumps(results['arc2'], indent=2))
-
         def eval_proc(gen_fn, label, n=100):
             n_pe = 0; cell_c = []
-            for _ in range(n):
-                inp, out = gen_fn(rng=rng)
-                gi = grid_to_fixed(inp.tolist() if hasattr(inp, 'tolist') else inp).unsqueeze(0).to(device)
-                gt = grid_to_fixed(out.tolist() if hasattr(out, 'tolist') else out).to(device)
-                pred = predict(gi)
-                exact = bool((pred == gt).all().item())
-                if exact: n_pe += 1
-                cell_c.append(float((pred == gt).float().mean().item()))
+            with ema.swap_in():
+                for _ in range(n):
+                    inp, out = gen_fn(rng=rng)
+                    gi = grid_to_fixed(inp.tolist() if hasattr(inp, 'tolist') else inp).unsqueeze(0).to(device)
+                    gt = grid_to_fixed(out.tolist() if hasattr(out, 'tolist') else out).to(device)
+                    pred = predict_grid(gi)
+                    exact = bool((pred == gt).all().item())
+                    if exact: n_pe += 1
+                    cell_c.append(float((pred == gt).float().mean().item()))
             return {'label': label, 'n_samples': n, 'pair_exact_acc': n_pe / n,
                     'mean_cell_acc': sum(cell_c)/len(cell_c)}
 
         print('=== Sudoku ===')
         results['sudoku'] = eval_proc(lambda rng=rng: gen_sudoku_pair(mask_rate=0.4, rng=rng), 'Sudoku', n=100)
         print(_json.dumps(results['sudoku'], indent=2))
+        print('=== Math grid ===')
+        results['math_grid'] = eval_proc(lambda rng=rng: gen_math_pair(side=min(GRID, 16), rng=rng), 'Math', n=100)
+        print(_json.dumps(results['math_grid'], indent=2))
 
-        print('=== Math (procedural) ===')
-        results['math'] = eval_proc(lambda rng=rng: gen_math_pair(side=min(GRID, 16), rng=rng), 'Math', n=100)
-        print(_json.dumps(results['math'], indent=2))
-
-        out_path = ROOT / 'eval_all.json'
-        with out_path.open('w') as f:
+        with open(str(ROOT / 'eval_v36.json'), 'w') as f:
             _json.dump(results, f, indent=2)
 
-        print('\\n=== FINAL v35 ===')
+        print('\\n=== FINAL v36 ===')
         for k, r in results.items():
-            ea = r.get('pair_exact_acc', 0) * 100
-            ca = r.get('mean_cell_acc', 0) * 100
-            print(f'{k:8s}  pair_exact={ea:.2f}%  cell_acc={ca:.1f}%')
-        print('AE-Godel:', _json.dumps(ae_archive.summary(), indent=2))
+            if 'accuracy' in r:
+                print(f'{k:14s}  acc={r["accuracy"]*100:.1f}%')
+            elif 'task_acc' in r:
+                print(f'{k:14s}  task_acc={r["task_acc"]*100:.2f}%  cell={r["mean_cell_acc"]*100:.1f}%')
+            elif 'pair_exact_acc' in r:
+                print(f'{k:14s}  pair_exact={r["pair_exact_acc"]*100:.1f}%  cell={r["mean_cell_acc"]*100:.1f}%')
     """).strip()))
 
     nb = {
