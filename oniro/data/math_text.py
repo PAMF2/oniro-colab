@@ -30,7 +30,7 @@ def _digits_to_grid(n: int, side: int) -> np.ndarray:
         if i >= side:
             break
         g[0, i] = (int(ch) % 10)
-    if n < 0:
+    if n < 0 and side >= 2:
         g[1, 0] = 9  # marker for negative
     return g
 
