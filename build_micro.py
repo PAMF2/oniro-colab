@@ -126,43 +126,31 @@ def main() -> None:
         if not ARC1_DIR.exists():
             subprocess.check_call(['git','clone','--depth','1',
                 'https://github.com/fchollet/ARC-AGI.git', str(ARC1_DIR)])
-        # RE-ARC: repo ships only the GENERATOR. Run it to materialise
-        # re_arc/tasks/*.json (per-task list of {input, output} pairs).
-        # generate_dataset accepts n_examples per task; we use 50 for speed
-        # (50 x 400 ARC-1 tasks = 20k augmented pairs total).
+        # RE-ARC: repo ships only the GENERATOR. Generation inline was hanging
+        # in Colab sessions (rate 0/s). Skip it by default; user can run the
+        # generator manually if they want. The training will simply not see
+        # RE-ARC samples and sample_one will fall through to other sources.
         if not REARC_DIR.exists():
-            subprocess.check_call(['git','clone','--depth','1',
-                'https://github.com/michaelhodel/re-arc.git', str(REARC_DIR)])
-        REARC_TASKS_DIR = REARC_DIR / 're_arc' / 'tasks'
-        if not REARC_TASKS_DIR.exists() or not any(REARC_TASKS_DIR.glob('*.json')):
-            print('RE-ARC: running generator (may take a few minutes)...')
             try:
-                gen_code = (
-                    "import sys, os; sys.path.insert(0, %r); "
-                    "os.chdir(%r); "
-                    "from main import generate_dataset; "
-                    "generate_dataset(n_examples=50, diff_lb=0, diff_ub=1)"
-                    % (str(REARC_DIR), str(REARC_DIR))
-                )
-                subprocess.check_call(['python', '-c', gen_code], timeout=900)
+                subprocess.check_call(['git','clone','--depth','1',
+                    'https://github.com/michaelhodel/re-arc.git', str(REARC_DIR)],
+                    timeout=60)
             except Exception as e:
-                print(f'RE-ARC generation failed (will run without): {e}')
-        # ARC-GEN (Google, arxiv:2511.00162): generator only, no shipped JSON.
-        # Generating 100 pairs x 400 tasks = ~40k examples takes too long in
-        # a Colab session; we generate a small subset (5 pairs x 50 tasks)
-        # purely as additional diversity. Drop if too slow.
+                print(f'RE-ARC clone failed (will run without): {e}')
+        # ARC-GEN: only generator code, no shipped data. Clone but expect 0.
         if not ARCGEN_DIR.exists():
             try:
                 subprocess.check_call(['git','clone','--depth','1',
-                    'https://github.com/google/ARC-GEN.git', str(ARCGEN_DIR)])
+                    'https://github.com/google/ARC-GEN.git', str(ARCGEN_DIR)],
+                    timeout=60)
             except Exception as e:
                 print(f'ARC-GEN clone failed (will run without): {e}')
-        # Enigmata sparse checkout often misses the actual data folder.
-        # Switch to full clone (small repo, ~few MB).
+        # Enigmata: full clone with timeout
         if not ENIGMATA_DIR.exists():
             try:
                 subprocess.check_call(['git','clone','--depth','1',
-                    'https://github.com/BytedTsinghua-SIA/Enigmata.git', str(ENIGMATA_DIR)])
+                    'https://github.com/BytedTsinghua-SIA/Enigmata.git', str(ENIGMATA_DIR)],
+                    timeout=60)
             except Exception as e:
                 print(f'Enigmata clone failed (will run without): {e}')
         # ConceptARC + Mini-ARC: pulled via neoneye collection (sparse, only what we need)
@@ -319,17 +307,10 @@ def main() -> None:
         HEAVY_FILES   = list((NEONEYE_DIR / 'dataset' / 'ARC-Heavy').rglob('*.json'))
 
         # RE-ARC stores per-task JSON in re_arc/tasks/ as a FLAT LIST of
-        # pairs [{"input", "output"}, ...] (no train/test split). The
-        # patched _pairs_from_task in arc_json_loader handles this format.
-        REARC_FILES = list(Path(REARC_ROOT).rglob('*.json'))
-        def _has_pairs(p):
-            try:
-                with p.open() as f:
-                    t = _json.load(f)
-                return len(_pairs_from_task(t)) > 0
-            except Exception:
-                return False
-        REARC_FILES = [p for p in REARC_FILES if _has_pairs(p)]
+        # pairs. _pairs_from_task in arc_json_loader handles this format.
+        # Skip the pre-filter (was slow on large dirs); _task_pairs_cached
+        # returns [] for files without valid pairs and sample_one retries.
+        REARC_FILES = list(Path(REARC_ROOT).rglob('*.json')) if REARC_DIR.exists() else []
 
         print(f'ARC1 tasks: {len(ARC1_FILES)}')
         print(f'ARC2 tasks: {len(ARC2_FILES)}')
@@ -413,35 +394,30 @@ def main() -> None:
         TAMA_DIR = ROOT / 'arc-dataset-tama'
 
         BARC_FILES = []
-        # BARC via HuggingFace (best-effort)
-        if not BARC_DIR.exists():
+        # BARC HuggingFace download was stalling Colab. Skip by default.
+        # User can enable with env var ONIRO_FETCH_BARC=1.
+        if os.environ.get('ONIRO_FETCH_BARC') == '1' and not BARC_DIR.exists():
             try:
-                subprocess.check_call(['pip', '-q', 'install', 'huggingface_hub'])
+                subprocess.check_call(['pip', '-q', 'install', 'huggingface_hub'],
+                                       timeout=120)
                 from huggingface_hub import snapshot_download
                 snapshot_download(repo_id="barc0/100k_yes_promptv2_problems_with_descriptions",
                                   repo_type="dataset", local_dir=str(BARC_DIR))
             except Exception as e:
                 print(f'BARC HF download failed (will run without): {e}')
-                BARC_DIR.mkdir(exist_ok=True)
         if BARC_DIR.exists():
-            # HF datasets may use .jsonl or parquet; try both
             BARC_FILES = (list(BARC_DIR.rglob('*.json'))
                           + list(BARC_DIR.rglob('*.jsonl')))
 
-        # H-ARC (le-gris/h-arc) - source code; actual data on OSF (zip)
-        if not HARC_DIR.exists():
-            try:
-                subprocess.check_call(['git','clone','--depth','1',
-                    'https://github.com/le-gris/h-arc.git', str(HARC_DIR)])
-            except Exception as e:
-                print(f'H-ARC clone failed (will run without): {e}')
-        HARC_FILES = list(HARC_DIR.rglob('*.json')) if HARC_DIR.exists() else []
+        # H-ARC: scripts only, no shipped data. Skip clone (was contributing 0).
+        HARC_FILES = []
 
         # neoneye/arc-dataset-tama (Big ARC tasks, standard ARC JSON format)
         if not TAMA_DIR.exists():
             try:
                 subprocess.check_call(['git','clone','--depth','1',
-                    'https://github.com/neoneye/arc-dataset-tama.git', str(TAMA_DIR)])
+                    'https://github.com/neoneye/arc-dataset-tama.git', str(TAMA_DIR)],
+                    timeout=120)
             except Exception as e:
                 print(f'arc-dataset-tama clone failed (will run without): {e}')
         TAMA_FILES = list(TAMA_DIR.rglob('*.json')) if TAMA_DIR.exists() else []
@@ -615,7 +591,13 @@ def main() -> None:
 
         # v40.2 aux loss weights
         MOL_LB_WEIGHT = 0.01
-        CODE_HEAD_WEIGHT = 0.05   # low weight on NULL target; will grow when ground-truth programs are available
+        CODE_HEAD_WEIGHT = 0.05
+
+        # v40.7 speed: fp16 autocast on CUDA T4 has fp16 tensor cores giving
+        # ~2x throughput for the URM forward (GQA + ConvSwiGLU).
+        USE_AMP = device == 'cuda'
+        amp_dtype = torch.float16 if USE_AMP else torch.float32
+        scaler = torch.cuda.amp.GradScaler() if USE_AMP else None
 
         t0 = time.time()
         for step in range(STEPS):
@@ -623,55 +605,59 @@ def main() -> None:
             urm.set_n_loops_eff(pdc_loops(step, STEPS, n_loops_full=N_LOOPS))
 
             g_in, g_out, arc_mask, op_id, code_tgt, code_mask = sample_batch(BATCH)
-            urm_input, op_tok = encode_v40(g_in, op_id, arc_mask)
-            urm_out = urm(urm_input, op_embed=op_tok)
-
-            loss = torch.zeros((), device=device)
-            n_states = len(urm_out['states_per_loop'])
-            n_cycles = n_states - 1
-            dis_targets = make_dis_targets(g_out, n_cycles=n_cycles,
-                                            n_colors=N_COLORS, max_corruption=0.5,
-                                            seed=step)
-            # v40.2 HSW: cycle weights ramp from uniform to late-heavy across training
-            hsw_w = hsw_weights(n_cycles=n_cycles, step=step, total_steps=STEPS,
-                                 decay=0.5, ramp_frac=0.5)
-            for t, state in enumerate(urm_out['states_per_loop'][1:]):
-                logits = decoder(state, GRID)
-                tgt = dis_targets[t].to(device)
-                loss = loss + float(hsw_w[t]) * socrates_grid_ce(
-                    logits, tgt, n_colors=N_COLORS,
-                    unknown_class=N_COLORS, gamma=0.05, bg_weight=0.15,
-                    safe_softmax=True,
-                )
-
-            # MoL load-balance aux loss (sum over all blocks)
-            lb_loss = torch.zeros((), device=device)
-            for blk in urm.blocks:
-                if blk.use_mol:
-                    lb_loss = lb_loss + blk.ffn.load_balance_loss().to(device)
-            loss = loss + MOL_LB_WEIGHT * lb_loss
-
-            # CodeHead aux (v40.3): use real program targets for DSL_COMPOSE
-            # samples (code_mask=1.0) and NULL_PROGRAM for others (code_mask=0.0).
-            # Loss is masked so non-compose samples contribute zero gradient.
-            code_logits = code_head(urm_out['final_state'],
-                                     op_token_idx=0, cell_start_idx=101)
-            B_cur, seq_len, V = code_logits.shape
-            per_step_ce = F.cross_entropy(
-                code_logits.reshape(-1, V),
-                code_tgt.reshape(-1),
-                reduction='none',
-            ).view(B_cur, seq_len).mean(dim=1)   # (B,)
-            # Weight compose samples (mask=1) at full weight, others at 0.05.
-            # 0.05 ensures the head doesn't drift to a degenerate constant.
-            per_sample_w = code_mask + 0.05 * (1.0 - code_mask)
-            code_loss = (per_step_ce * per_sample_w).sum() / per_sample_w.sum().clamp_min(1.0)
-            loss = loss + CODE_HEAD_WEIGHT * code_loss
 
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-            opt.step()
+            with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=USE_AMP):
+                urm_input, op_tok = encode_v40(g_in, op_id, arc_mask)
+                urm_out = urm(urm_input, op_embed=op_tok)
+
+                loss = torch.zeros((), device=device)
+                n_states = len(urm_out['states_per_loop'])
+                n_cycles = n_states - 1
+                dis_targets = make_dis_targets(g_out, n_cycles=n_cycles,
+                                                n_colors=N_COLORS, max_corruption=0.5,
+                                                seed=step)
+                hsw_w = hsw_weights(n_cycles=n_cycles, step=step, total_steps=STEPS,
+                                     decay=0.5, ramp_frac=0.5)
+                for t, state in enumerate(urm_out['states_per_loop'][1:]):
+                    logits = decoder(state, GRID)
+                    tgt = dis_targets[t].to(device)
+                    loss = loss + float(hsw_w[t]) * socrates_grid_ce(
+                        logits, tgt, n_colors=N_COLORS,
+                        unknown_class=N_COLORS, gamma=0.05, bg_weight=0.15,
+                        safe_softmax=True,
+                    )
+
+                # MoL load-balance aux
+                lb_loss = torch.zeros((), device=device)
+                for blk in urm.blocks:
+                    if blk.use_mol:
+                        lb_loss = lb_loss + blk.ffn.load_balance_loss().to(device)
+                loss = loss + MOL_LB_WEIGHT * lb_loss
+
+                # CodeHead aux
+                code_logits = code_head(urm_out['final_state'],
+                                         op_token_idx=0, cell_start_idx=101)
+                B_cur, seq_len, V = code_logits.shape
+                per_step_ce = F.cross_entropy(
+                    code_logits.reshape(-1, V),
+                    code_tgt.reshape(-1),
+                    reduction='none',
+                ).view(B_cur, seq_len).mean(dim=1)
+                per_sample_w = code_mask + 0.05 * (1.0 - code_mask)
+                code_loss = (per_step_ce * per_sample_w).sum() / per_sample_w.sum().clamp_min(1.0)
+                loss = loss + CODE_HEAD_WEIGHT * code_loss
+
+            if USE_AMP:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                opt.step()
             sched.step()
             ema.update()
 
