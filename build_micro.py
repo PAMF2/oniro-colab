@@ -419,7 +419,8 @@ def main() -> None:
             # Math-v2: per-op arc_mask decided inside (0.0 pure / 0.5 spatial)
             ('Math-v2',   0.10, 0.0, None,                  _math_v2_with_op),
             ('Enigmata',  0.06, 0.5, ENIGMATA_OP_ID,        lambda: (sample_arc(ENIGMATA_FILES), None, None, None)),
-            ('Sudoku',    0.04, 0.0, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None, None, None)),
+            # Sudoku: 9x9 with 3x3 sub-grid constraint = spatial structure -> hybrid
+            ('Sudoku',    0.04, 0.5, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None, None, None)),
             ('CA',        0.04, 0.5, None,                  _ca_with_op),
             ('Compose',   0.02, 0.5, OP_ID["DSL_COMPOSE"],  _compose_with_program),
             # H-ARC (v40.4 add): human traces, vision pathway
