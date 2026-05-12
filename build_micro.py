@@ -263,6 +263,69 @@ def main() -> None:
                    str(ckpt_dir / 'urm_micro_rl_final.pt'))
     """).strip()))
 
+    cells.append(md("## DSL Hybrid Solver eval (symbolic + neural fallback)"))
+    cells.append(code(textwrap.dedent("""
+        from oniro.dsl.solver import solve_task as dsl_solve_task
+        import numpy as np
+
+        def neural_predict_np(grid_np):
+            gi = grid_to_fixed(grid_np.tolist()).unsqueeze(0).to(device)
+            with torch.no_grad():
+                e = encoder(gi)
+                u = urm(e['tokens'])
+                l = decoder(u['final_state'], GRID)
+                return l.argmax(dim=1)[0].cpu().numpy().astype(np.int8)
+
+        def eval_arc_hybrid(root, label):
+            sd = Path(root) / 'evaluation'
+            files = sorted(sd.glob('*.json'))
+            n_pe = 0; n_t = 0; cells_c = []; ts = 0; tt = 0
+            n_dsl_solved = 0; n_dsl_tried = 0
+            for ti, tf in enumerate(files):
+                with tf.open() as f:
+                    task = _json.load(f)
+                res = dsl_solve_task(task, neural_fallback=neural_predict_np, max_depth=2)
+                if res['method'] == 'dsl': n_dsl_tried += 1
+                solved = []
+                for i, tp in enumerate(task.get('test', [])):
+                    if 'output' not in tp: continue
+                    gt = np.asarray(tp['output'], dtype=np.int8)
+                    pred = res['predictions'][i] if i < len(res['predictions']) else None
+                    if pred is None:
+                        pred = neural_predict_np(np.asarray(tp['input'], dtype=np.int8))
+                    if pred.shape == gt.shape:
+                        exact = bool(np.array_equal(pred, gt))
+                        cell_acc = float((pred == gt).mean())
+                    else:
+                        exact = False; cell_acc = 0.0
+                    n_t += 1
+                    if exact:
+                        n_pe += 1
+                        if res['method'] == 'dsl': n_dsl_solved += 1
+                    cells_c.append(cell_acc)
+                    solved.append(exact)
+                if solved:
+                    tt += 1
+                    if all(solved): ts += 1
+                if (ti + 1) % 50 == 0:
+                    print(f'  {label} hybrid [{ti+1}/{len(files)}] exact={n_pe}/{n_t}  dsl_solved={n_dsl_solved}')
+            return {'label': label, 'pairs_total': n_t, 'pairs_exact': n_pe,
+                    'pair_exact_acc': n_pe / max(n_t, 1),
+                    'mean_cell_acc': sum(cells_c)/max(len(cells_c), 1),
+                    'tasks_total': tt, 'tasks_solved': ts,
+                    'task_acc': ts / max(tt, 1),
+                    'dsl_solved_pairs': n_dsl_solved}
+
+        print('=== ARC-AGI-1 hybrid (DSL + neural) ===')
+        r1_hybrid = eval_arc_hybrid(ARC1_ROOT, 'ARC-1-hybrid')
+        print(_json.dumps(r1_hybrid, indent=2))
+        print('=== ARC-AGI-2 hybrid (DSL + neural) ===')
+        r2_hybrid = eval_arc_hybrid(ARC2_ROOT, 'ARC-2-hybrid')
+        print(_json.dumps(r2_hybrid, indent=2))
+        with open(str(ROOT / 'eval_hybrid.json'), 'w') as f:
+            _json.dump({'arc1': r1_hybrid, 'arc2': r2_hybrid}, f, indent=2)
+    """).strip()))
+
     cells.append(md("## Eval: ARC-1, ARC-2 (TTFT + AIRV), Sudoku, Math"))
     cells.append(code(textwrap.dedent("""
         from oniro.eval.ttft_urm import ttft_finetune_urm, restore_urm, airv_predict
