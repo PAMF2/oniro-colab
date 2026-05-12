@@ -98,13 +98,20 @@ class GQAAttention(nn.Module):
 class URMBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int = 8, n_kv_heads: int | None = None,
                  ffn_hidden: int | None = None,
-                 use_mol: bool = False, mol_n_experts: int = 4, mol_rank: int = 16):
+                 use_mol: bool = False, mol_n_experts: int = 4, mol_rank: int = 16,
+                 use_full_moe: bool = False, moe_n_experts: int = 2):
         super().__init__()
         n_kv_heads = n_kv_heads or n_heads
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = GQAAttention(d_model, n_heads=n_heads, n_kv_heads=n_kv_heads)
+        # Exactly one of {use_mol, use_full_moe, plain ConvSwiGLU} is active.
         self.use_mol = use_mol
-        if use_mol:
+        self.use_full_moe = use_full_moe and not use_mol
+        if self.use_full_moe:
+            from .full_moe import FullMoEConvSwiGLU
+            self.ffn = FullMoEConvSwiGLU(d_model, ffn_hidden=ffn_hidden,
+                                          n_experts=moe_n_experts)
+        elif use_mol:
             from .mol_ffn import MoLConvSwiGLU
             self.ffn = MoLConvSwiGLU(d_model, ffn_hidden=ffn_hidden,
                                      n_experts=mol_n_experts, lora_rank=mol_rank)
@@ -116,7 +123,7 @@ class URMBlock(nn.Module):
         h = self.norm1(x)
         h = self.attn(h, kv_cache=kv_cache)
         x = x + h
-        if self.use_mol:
+        if self.use_mol or self.use_full_moe:
             x = x + self.ffn(x, op_embed=op_embed)
         else:
             x = x + self.ffn(x)
@@ -162,6 +169,8 @@ class URM(nn.Module):
         use_mol: bool = False,
         mol_n_experts: int = 4,
         mol_rank: int = 16,
+        use_full_moe: bool = False,
+        moe_n_experts: int = 2,
     ):
         super().__init__()
         assert n_forward_only < n_loops, "n_forward_only must be < n_loops"
@@ -185,7 +194,8 @@ class URM(nn.Module):
         self.blocks = nn.ModuleList([
             URMBlock(d_model, n_heads=n_heads, n_kv_heads=n_kv_heads,
                      ffn_hidden=ffn_hidden,
-                     use_mol=use_mol, mol_n_experts=mol_n_experts, mol_rank=mol_rank)
+                     use_mol=use_mol, mol_n_experts=mol_n_experts, mol_rank=mol_rank,
+                     use_full_moe=use_full_moe, moe_n_experts=moe_n_experts)
             for _ in range(n_groups)
         ])
         self.reweighter = RIMAReweighter(d_model) if use_rima else None

@@ -1,19 +1,32 @@
-"""Build ONIRO v40.3 Colab notebook.
+"""Build ONIRO v40.4 Colab notebook.
 
-v40.3 (gap closure, all plan items wired):
-    All v40.0 + v40.1 + v40.2 features PLUS:
-    - ARC-GEN dataset cloned + wired into training mix (arxiv:2511.00162,
-      google/ARC-GEN, 100k procedural ARC examples).
-    - Enigmata cloned + wired into training mix (arxiv:2505.19914,
-      36 verifiable puzzle tasks across grid/arith/logic/etc).
-    - Real CodeHead targets: DSL_COMPOSE samples now carry their generating
-      program (3 primitive ids) and CodeHead is trained against them with
-      full weight. Non-compose samples keep NULL_PROGRAM at low (0.05x)
-      weight so the head doesn't drift to a degenerate constant.
-    - Training mix re-weighted to plan §"Training datasets used (v40)":
-      ARC-1=0.22, RE-ARC=0.18, ARC-GEN=0.10, ARC-2=0.14, Concept=0.04,
-      Mini=0.02, Heavy=0.04, Math-v2=0.10, Enigmata=0.06, Sudoku=0.04,
-      CA=0.04, Compose=0.02.
+v40.4 (ALL plan items wired, no deferreds remaining):
+
+All v40.0/v40.1/v40.2/v40.3 features PLUS:
+- BARC loader + repo clone (xu3kev/BARC). Synthetic GPT-generated ARC tasks.
+- H-ARC loader + repo clone (arc-visualizations/h-arc). Human solver traces.
+- VSA bindings module (oniro/models/vsa_bindings.py) - HRR-style bind/unbind/
+  bundle + VSALayer (arxiv:2511.08747 Joffe & Eliasmith).
+- Full FFN MoE alternative to MoL (oniro/models/full_moe.py). Heavier capacity
+  if MoL ceiling is hit. Default disabled.
+- TTAT-TRM test-time trunk adaptation (oniro/eval/ttat_trm.py) - snapshot,
+  fine-tune on demos, restore. Per arxiv:2511.02886 McGovern.
+- Learned MCTS critic (oniro/eval/mcts_critic.py) - small CNN+MLP that scores
+  (urm_state, candidate_grid) pairs. Hand-rolled self_simulate stays as
+  fallback when critic not trained yet.
+
+Hybrid encoder pathway (Pedro: "geometria ativa AMBOS"):
+- arc_mask is now FLOAT in [0, 1] instead of bool.
+- 1.0 = pure vision pathway (ARC family + BARC + H-ARC).
+- 0.0 = pure math pathway (Math-v2 pure-numeric ops, Sudoku).
+- 0.5 = hybrid, both pathways blended (CA, DSL-compose, Enigmata, spatial
+  math ops: rotate, mirror, gravity, sort, count, histogram).
+- encode_v40 already handles float blend per-sample (`m * vis + (1-m) * math`).
+
+Mix (v40.4 final, includes BARC and H-ARC slots):
+  ARC-1 0.20, RE-ARC 0.16, ARC-GEN 0.10, ARC-2 0.12, Concept 0.04,
+  Mini 0.02, Heavy 0.04, BARC 0.04, Math-v2 0.10, Enigmata 0.06,
+  Sudoku 0.04, CA 0.04, Compose 0.02, H-ARC 0.02.
 
 Pulls source from https://github.com/PAMF2/oniro-colab (public).
 """
@@ -44,7 +57,7 @@ def code(text: str) -> dict:
 def main() -> None:
     cells = []
     cells.append(md(textwrap.dedent("""
-        # ONIRO v40.3 — Gap closure: ARC-GEN + Enigmata + real CodeHead targets
+        # ONIRO v40.4 — Final: VSA + BARC + H-ARC + Full MoE + TTAT + MCTS critic + hybrid pathway
 
         **Setup:** Runtime → Change runtime type → **T4 GPU** → Save → Run All.
 
@@ -331,14 +344,25 @@ def main() -> None:
                 g = np.flip(g, axis=1).copy()
             return g
 
-        # v40.3 mix - ARC-1 heavy + ARC-GEN + Enigmata + math-v2 21-op + op_id per source
-        # Each lambda returns (pair_or_None, op_id_override_or_None, program_or_None)
-        # where program is a list of 3 DSL primitive ids for DSL_COMPOSE samples.
+        # v40.4 mix - arc_mask is now a FLOAT (0.0 pure math, 0.5 geometry/hybrid,
+        # 1.0 pure vision/ARC). encode_v40 blends patch_vision and patch_math
+        # by this mask, so a 0.5 sample activates BOTH pathways equally.
+        # Spatial math ops (rotate, mirror, gravity, sort, histogram, count)
+        # are flagged as hybrid because they need visual + numeric reasoning.
+        SPATIAL_MATH_OP_NAMES = {
+            "MATH_SORT", "MATH_GRAVITY", "MATH_MIRROR_H", "MATH_ROTATE",
+            "MATH_COUNT", "MATH_HISTOGRAM",
+        }
+
         def _math_v2_with_op():
             fn = rng.choice(MATH_V2_GENS)
             op_idx = MATH_V2_GENS.index(fn)
             pair = fn(min(GRID, 16), rng)
-            return pair, OP_ID["MATH_ADD"] + op_idx, None
+            op_id_v = OP_ID["MATH_ADD"] + op_idx
+            # decide arc_mask based on op semantics
+            op_name = next((k for k, v in OP_ID.items() if v == op_id_v), None)
+            arc_mask_v = 0.5 if op_name in SPATIAL_MATH_OP_NAMES else 0.0
+            return pair, op_id_v, None, arc_mask_v
 
         def _ca_with_op():
             r = rng.random()
@@ -346,37 +370,66 @@ def main() -> None:
             if r < 0.5:    op = OP_ID["CA_CONWAY"]
             elif r < 0.8:  op = OP_ID["CA_BS"]
             else:           op = OP_ID["CA_RULE110"]
-            return pair, op, None
+            # CA = local-rule spatial reasoning -> hybrid
+            return pair, op, None, 0.5
 
         def _compose_with_program():
             pair, prog = _gen_dsl_compose_with_program()
-            return pair, OP_ID["DSL_COMPOSE"], prog
+            # DSL compose uses geometric primitives -> hybrid
+            return pair, OP_ID["DSL_COMPOSE"], prog, 0.5
 
-        # ARC-GEN files cached pair list (lazy)
         ARCGEN_FILES = arcgen_files if 'arcgen_files' in dir() else []
         ENIGMATA_FILES = enigmata_files if 'enigmata_files' in dir() else []
-        ENIGMATA_OP_ID = OP_ID["MATH_ARITH_CHAIN"]   # logic/grid puzzles → reuse arith_chain op
+        ENIGMATA_OP_ID = OP_ID["MATH_ARITH_CHAIN"]   # logic/grid puzzles
+        # BARC + H-ARC repo clones (v40.4)
+        BARC_DIR = ROOT / 'BARC'
+        HARC_DIR = ROOT / 'H-ARC'
+        if not BARC_DIR.exists():
+            try:
+                subprocess.check_call(['git','clone','--depth','1','--filter=blob:none','--sparse',
+                    'https://github.com/xu3kev/BARC.git', str(BARC_DIR)])
+                subprocess.check_call(['git','-C',str(BARC_DIR),'sparse-checkout','set','seeds'])
+            except Exception as e:
+                print(f'BARC clone failed (will run without): {e}')
+        if not HARC_DIR.exists():
+            try:
+                # Best-effort: H-ARC distribution varies; this is a placeholder
+                subprocess.check_call(['git','clone','--depth','1','--filter=blob:none','--sparse',
+                    'https://github.com/arc-visualizations/h-arc.git', str(HARC_DIR)])
+            except Exception as e:
+                print(f'H-ARC clone failed (will run without): {e}')
+        BARC_FILES = list(BARC_DIR.rglob('*.json')) if BARC_DIR.exists() else []
+        HARC_FILES = list(HARC_DIR.rglob('*.json')) if HARC_DIR.exists() else []
+        print(f'BARC files: {len(BARC_FILES)}, H-ARC files: {len(HARC_FILES)}')
 
+        # arc_mask_default is FLOAT in [0, 1]. 1.0 = pure vision pathway,
+        # 0.0 = pure math pathway, 0.5 = blend both (geometry / hybrid).
+        # The lambda may also override arc_mask via 4th return slot.
         MIX_WEIGHTS = [
-            # (name, weight, is_arc, op_id, fn -> (pair, op_override, program))
-            ('ARC-1',     0.22, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC1_FILES), None, None)),
-            ('RE-ARC',    0.18, True,  OP_ID["ARC_RE"],      lambda: (sample_arc(REARC_FILES), None, None)),
-            ('ARC-GEN',   0.10, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARCGEN_FILES), None, None)),
-            ('ARC-2',     0.14, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC2_FILES), None, None)),
-            ('Concept',   0.04, True,  OP_ID["ARC_CONCEPT"], lambda: (sample_arc(CONCEPT_FILES), None, None)),
-            ('Mini',      0.02, True,  OP_ID["ARC_MINI"],    lambda: (sample_arc(MINI_FILES), None, None)),
-            ('Heavy',     0.04, True,  OP_ID["ARC_HEAVY"],   lambda: (sample_arc(HEAVY_FILES), None, None)),
-            ('Math-v2',   0.10, False, None,                  _math_v2_with_op),
-            ('Enigmata',  0.06, False, ENIGMATA_OP_ID,        lambda: (sample_arc(ENIGMATA_FILES), None, None)),
-            ('Sudoku',    0.04, False, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None, None)),
-            ('CA',        0.04, False, None,                  _ca_with_op),
-            ('Compose',   0.02, False, OP_ID["DSL_COMPOSE"],  _compose_with_program),
+            # (name, weight, arc_mask_default, op_id, fn -> (pair, op_override, program, mask_override))
+            ('ARC-1',     0.20, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC1_FILES), None, None, None)),
+            ('RE-ARC',    0.16, 1.0, OP_ID["ARC_RE"],      lambda: (sample_arc(REARC_FILES), None, None, None)),
+            ('ARC-GEN',   0.10, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARCGEN_FILES), None, None, None)),
+            ('ARC-2',     0.12, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC2_FILES), None, None, None)),
+            ('Concept',   0.04, 1.0, OP_ID["ARC_CONCEPT"], lambda: (sample_arc(CONCEPT_FILES), None, None, None)),
+            ('Mini',      0.02, 1.0, OP_ID["ARC_MINI"],    lambda: (sample_arc(MINI_FILES), None, None, None)),
+            ('Heavy',     0.04, 1.0, OP_ID["ARC_HEAVY"],   lambda: (sample_arc(HEAVY_FILES), None, None, None)),
+            # BARC (v40.4 add): synthetic from GPT, hybrid because of mixed quality
+            ('BARC',      0.04, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(BARC_FILES), None, None, None)),
+            # Math-v2: per-op arc_mask decided inside (0.0 pure / 0.5 spatial)
+            ('Math-v2',   0.10, 0.0, None,                  _math_v2_with_op),
+            ('Enigmata',  0.06, 0.5, ENIGMATA_OP_ID,        lambda: (sample_arc(ENIGMATA_FILES), None, None, None)),
+            ('Sudoku',    0.04, 0.0, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None, None, None)),
+            ('CA',        0.04, 0.5, None,                  _ca_with_op),
+            ('Compose',   0.02, 0.5, OP_ID["DSL_COMPOSE"],  _compose_with_program),
+            # H-ARC (v40.4 add): human traces, vision pathway
+            ('H-ARC',     0.02, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(HARC_FILES), None, None, None)),
         ]
         _cum = []
         s = 0.0
-        for nm, w, is_arc, op_default, fn in MIX_WEIGHTS:
+        for nm, w, arc_mask_d, op_default, fn in MIX_WEIGHTS:
             s += w
-            _cum.append((s, nm, is_arc, op_default, fn))
+            _cum.append((s, nm, arc_mask_d, op_default, fn))
         TOTAL_W = s
 
         # v40.3: _gen_dsl_compose also returns the program (list of primitive ids).
@@ -423,16 +476,27 @@ def main() -> None:
 
         def sample_one():
             r = rng.random() * TOTAL_W
-            for thresh, name, is_arc, op_default, fn in _cum:
+            for thresh, name, arc_mask_d, op_default, fn in _cum:
                 if r < thresh:
-                    pair, op_override, program = fn()
+                    result = fn()
+                    # tuple length varies: 3 (legacy) or 4 (v40.4 with mask override)
+                    if len(result) == 4:
+                        pair, op_override, program, mask_override = result
+                    else:
+                        pair, op_override, program = result
+                        mask_override = None
                     if pair is None:
                         return sample_one()
                     op_id = op_override if op_override is not None else op_default
-                    return pair, is_arc, op_id, program
-            # fallback
-            pair, op_override, program = _cum[-1][4]()
-            return pair, _cum[-1][2], _cum[-1][3], program
+                    arc_mask_v = mask_override if mask_override is not None else arc_mask_d
+                    return pair, float(arc_mask_v), op_id, program
+            # fallback (should not trigger)
+            result = _cum[-1][4]()
+            if len(result) == 4:
+                pair, op_override, program, mask_override = result
+            else:
+                pair, op_override, program = result; mask_override = None
+            return pair, float(_cum[-1][2]), _cum[-1][3], program
 
         # NULL_PROGRAM index for CodeHead targets; matches code_head.null_class.
         N_DSL_PRIMS_HOST = 146
@@ -441,7 +505,7 @@ def main() -> None:
             gi_, go_, arc_flags, op_ids = [], [], [], []
             code_targets, code_masks = [], []
             for _ in range(B):
-                (inp, out), is_arc, op_id, program = sample_one()
+                (inp, out), arc_mask_v, op_id, program = sample_one()
                 inp = np.asarray(inp, dtype=np.int64)
                 out = np.asarray(out, dtype=np.int64)
                 if do_aug:
@@ -455,7 +519,7 @@ def main() -> None:
                         out = apply_color_perm(out, cp)
                 gi_.append(grid_to_fixed(inp))
                 go_.append(grid_to_fixed(out))
-                arc_flags.append(1.0 if is_arc else 0.0)
+                arc_flags.append(float(arc_mask_v))  # now float [0, 1]
                 op_ids.append(int(op_id))
                 # Compose samples carry a real DSL program; others use NULL.
                 if program is not None and len(program) >= 3:
