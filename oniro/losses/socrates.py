@@ -37,6 +37,7 @@ def socrates_grid_ce(
     unknown_class: int = 10,
     gamma: float = 0.05,
     bg_weight: float = 0.15,
+    safe_softmax: bool = False,
 ) -> torch.Tensor:
     """Socrates-style CE for grid classification.
 
@@ -47,11 +48,17 @@ def socrates_grid_ce(
                 gamma=0 collapses to standard CE; gamma>0 rewards calibrated
                 uncertainty.
         bg_weight: scale factor for the background class (target==0)
+        safe_softmax: when True, subtract per-pixel max from logits before
+                       softmax for extra numerical stability. F.log_softmax
+                       does this internally already; this flag is mainly a
+                       v40.2 toggle to make the behaviour explicit.
 
     Returns: scalar loss.
     """
     B, C, H, W = logits.shape
     assert C == n_colors + 1, f"expected C={n_colors+1}, got {C}"
+    if safe_softmax:
+        logits = logits - logits.max(dim=1, keepdim=True).values
     log_probs = F.log_softmax(logits, dim=1)
     probs = log_probs.exp()
     # gather p(target) and p(unknown)
