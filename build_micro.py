@@ -208,24 +208,24 @@ def main() -> None:
         if device == 'cpu':
             print('WARNING: GPU not active. Runtime → Change runtime type → T4 GPU')
 
-        # v40.0 config
+        # v40.8 config - shrunk for T4 throughput (~2 step/s vs 0/s on D=768)
         GRID = 30
-        D = 768
-        N_HEADS = 12
-        N_KV_HEADS = 3
-        FFN = 3584
-        N_LOOPS = 12
+        D = 384            # half of v40.7 (768)
+        N_HEADS = 8
+        N_KV_HEADS = 2
+        FFN = 1536         # half of v40.7 (3584)
+        N_LOOPS = 8        # 12 -> 8
         N_GROUPS = 2
-        N_FORWARD_ONLY = 3
+        N_FORWARD_ONLY = 2
         KV_REFRESH = 2
         N_COLORS = 10
-        N_OUT_CLASSES = N_COLORS + 1   # +1 for UNKNOWN (Socrates)
+        N_OUT_CLASSES = N_COLORS + 1
         PATCH_SIZE = 3
-        BATCH = 8
+        BATCH = 12         # 8 -> 12 (smaller model fits more)
 
         # MoL config
         MOL_N_EXPERTS = 4
-        MOL_RANK = 16
+        MOL_RANK = 8       # 16 -> 8 (matches smaller D)
 
         # Dual-encoder split: vision (PatchEncoder) + math (MathPatchEncoder)
         cell_enc = GridTokenEncoder(grid_size=GRID, n_colors=N_COLORS, d_model=D).to(device)
@@ -593,10 +593,9 @@ def main() -> None:
         MOL_LB_WEIGHT = 0.01
         CODE_HEAD_WEIGHT = 0.05
 
-        # v40.7 speed: fp16 autocast on CUDA T4 has fp16 tensor cores giving
-        # ~2x throughput for the URM forward (GQA + ConvSwiGLU).
+        # v40.7+ fp16 autocast on CUDA. Use the older torch.cuda.amp namespace
+        # which exists across torch 1.x and 2.x to avoid API mismatch.
         USE_AMP = device == 'cuda'
-        amp_dtype = torch.float16 if USE_AMP else torch.float32
         scaler = torch.cuda.amp.GradScaler() if USE_AMP else None
 
         t0 = time.time()
@@ -607,7 +606,7 @@ def main() -> None:
             g_in, g_out, arc_mask, op_id, code_tgt, code_mask = sample_batch(BATCH)
 
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=USE_AMP):
+            with torch.cuda.amp.autocast(enabled=USE_AMP, dtype=torch.float16):
                 urm_input, op_tok = encode_v40(g_in, op_id, arc_mask)
                 urm_out = urm(urm_input, op_embed=op_tok)
 
