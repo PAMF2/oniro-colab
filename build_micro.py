@@ -12,13 +12,18 @@ from pathlib import Path
 OUT = Path(__file__).parent / "oniro_colab_micro.ipynb"
 
 
+def _lines(text: str) -> list[str]:
+    parts = text.split("\n")
+    return [p + "\n" for p in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+
 def md(text: str) -> dict:
-    return {"cell_type": "markdown", "metadata": {}, "source": text.split("\n")}
+    return {"cell_type": "markdown", "metadata": {}, "source": _lines(text)}
 
 
 def code(text: str) -> dict:
     return {"cell_type": "code", "execution_count": None, "metadata": {},
-            "outputs": [], "source": text.split("\n")}
+            "outputs": [], "source": _lines(text)}
 
 
 def main() -> None:
