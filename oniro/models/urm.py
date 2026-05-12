@@ -97,18 +97,29 @@ class GQAAttention(nn.Module):
 
 class URMBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int = 8, n_kv_heads: int | None = None,
-                 ffn_hidden: int | None = None):
+                 ffn_hidden: int | None = None,
+                 use_mol: bool = False, mol_n_experts: int = 4, mol_rank: int = 16):
         super().__init__()
         n_kv_heads = n_kv_heads or n_heads
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = GQAAttention(d_model, n_heads=n_heads, n_kv_heads=n_kv_heads)
-        self.ffn = ConvSwiGLU(d_model, ffn_hidden=ffn_hidden)
+        self.use_mol = use_mol
+        if use_mol:
+            from .mol_ffn import MoLConvSwiGLU
+            self.ffn = MoLConvSwiGLU(d_model, ffn_hidden=ffn_hidden,
+                                     n_experts=mol_n_experts, lora_rank=mol_rank)
+        else:
+            self.ffn = ConvSwiGLU(d_model, ffn_hidden=ffn_hidden)
 
-    def forward(self, x: torch.Tensor, kv_cache: dict | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache: dict | None = None,
+                op_embed: torch.Tensor | None = None) -> torch.Tensor:
         h = self.norm1(x)
         h = self.attn(h, kv_cache=kv_cache)
         x = x + h
-        x = x + self.ffn(x)
+        if self.use_mol:
+            x = x + self.ffn(x, op_embed=op_embed)
+        else:
+            x = x + self.ffn(x)
         return x
 
 
@@ -148,6 +159,9 @@ class URM(nn.Module):
         use_rima: bool = False,
         n_groups: int = 1,
         kv_refresh_every: int = 1,
+        use_mol: bool = False,
+        mol_n_experts: int = 4,
+        mol_rank: int = 16,
     ):
         super().__init__()
         assert n_forward_only < n_loops, "n_forward_only must be < n_loops"
@@ -162,45 +176,63 @@ class URM(nn.Module):
         self.n_groups = n_groups
         self.group_loops = n_loops // n_groups
         self.kv_refresh_every = max(1, kv_refresh_every)
+        self.use_mol = use_mol
+
+        # CGAR PDC: effective loop count can be reduced at runtime.
+        # Defaults to full n_loops; setter changes for curriculum.
+        self._n_loops_eff = n_loops
 
         self.blocks = nn.ModuleList([
-            URMBlock(d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, ffn_hidden=ffn_hidden)
+            URMBlock(d_model, n_heads=n_heads, n_kv_heads=n_kv_heads,
+                     ffn_hidden=ffn_hidden,
+                     use_mol=use_mol, mol_n_experts=mol_n_experts, mol_rank=mol_rank)
             for _ in range(n_groups)
         ])
         self.reweighter = RIMAReweighter(d_model) if use_rima else None
         self.final_norm = nn.LayerNorm(d_model)
-        # legacy alias for tests / loaders that reach for `.block`
         if n_groups == 1:
             self.block = self.blocks[0]
 
-    def _step(self, block: URMBlock, cur: torch.Tensor, kv_cache: dict | None) -> torch.Tensor:
-        new = block(cur, kv_cache=kv_cache)
+    def set_n_loops_eff(self, n: int) -> None:
+        """CGAR PDC: shrink effective loop count for shallow curriculum phase.
+        Must be <= n_loops and divisible by n_groups."""
+        n = max(self.n_groups, min(self.n_loops, n))
+        if n % self.n_groups != 0:
+            n = (n // self.n_groups) * self.n_groups
+        self._n_loops_eff = n
+
+    @property
+    def n_loops_eff(self) -> int:
+        return self._n_loops_eff
+
+    def _step(self, block: URMBlock, cur: torch.Tensor, kv_cache: dict | None,
+              op_embed: torch.Tensor | None = None) -> torch.Tensor:
+        new = block(cur, kv_cache=kv_cache, op_embed=op_embed)
         if self.reweighter is not None:
             new = self.reweighter(new, cur)
         return new
 
-    def forward(self, x: torch.Tensor) -> dict:
+    def forward(self, x: torch.Tensor,
+                op_embed: torch.Tensor | None = None) -> dict:
         states = [x]
         cur = x
         global_cycle = 0
+        # Use the effective group_loops based on the PDC schedule.
+        group_loops_eff = max(1, self._n_loops_eff // self.n_groups)
         for block in self.blocks:
             kv_cache = {"valid": False}
-            for c in range(self.group_loops):
+            for c in range(group_loops_eff):
                 if c % self.kv_refresh_every == 0:
                     kv_cache = {"valid": False}
-                # Invalidate cache at no_grad/grad boundary so the first grad
-                # cycle recomputes K,V with a grad-tracked path (otherwise
-                # cached K,V are detached and the first grad cycle would lose
-                # K,V gradient flow until the next scheduled refresh).
                 if global_cycle == self.n_forward_only:
                     kv_cache = {"valid": False}
                 if global_cycle < self.n_forward_only:
                     with torch.no_grad():
-                        cur = self._step(block, cur, kv_cache=kv_cache)
+                        cur = self._step(block, cur, kv_cache=kv_cache, op_embed=op_embed)
                     if global_cycle + 1 == self.n_forward_only:
                         cur = cur.detach()
                 else:
-                    cur = self._step(block, cur, kv_cache=kv_cache)
+                    cur = self._step(block, cur, kv_cache=kv_cache, op_embed=op_embed)
                 states.append(cur)
                 global_cycle += 1
         final = self.final_norm(cur)

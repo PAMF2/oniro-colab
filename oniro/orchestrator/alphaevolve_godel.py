@@ -86,6 +86,7 @@ def alphaevolve_godel_round(
     archive: AlphaEvolveGodelArchive | None = None,
     rng: random.Random | None = None,
     name_filter: str | None = None,
+    population_size: int = 1,
 ) -> tuple[bool, float, float, AlphaEvolveGodelArchive]:
     """One AlphaEvolve-Gödel round.
 
@@ -108,7 +109,10 @@ def alphaevolve_godel_round(
     weights = [archive.sample_weight(n) for n, _ in params]
     tried_param_names: list[str] = []
 
-    for _ in range(n_candidates):
+    # population_size > 1 expands the candidate pool by that factor.
+    # Each "generation" is a wider ES round; we still accept only the best.
+    effective_candidates = n_candidates * max(1, population_size)
+    for _ in range(effective_candidates):
         # Failure-aware sampling: bias toward params with prior success
         name, p = rng.choices(params, weights=weights, k=1)[0]
         tried_param_names.append(name)

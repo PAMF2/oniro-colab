@@ -1,13 +1,16 @@
-"""Build ONIRO v37 Colab notebook.
+"""Build ONIRO v40.0 Colab notebook.
 
-v37 changes vs v36:
-    - Numeric only - text head/loss/dataset removed (Pedro: "treinar so com num")
-    - Visao + numero: dual encoder (cell tokens + patch tokens 3x3 ViT-style)
-    - Socrates Loss with UNKNOWN class (arxiv:2604.12245)
-    - Cellular Automata pretraining mix (Conway + B/S + rule110)
-    - Multi-source ARC: ARC-AGI-1/2 + RE-ARC + ConceptARC + Mini-ARC + BARC
-    - Bigger TTA: 128 samples per test grid
-    - Architecture retained: URM 20M GQA + KV cache + EMA (v36.1)
+v40.0 (math-as-code, sub-version 1 of 3):
+    - Op-conditioning: OpEmbedding(32, D) injected as first token of URM input
+    - Dual-encoder split: PatchEncoder (vision) for ARC, MathPatchEncoder (numeric)
+      for math/sudoku/CA/compose. Both produce 100 tokens.
+    - MoL (Mixture of LoRAs) on ConvSwiGLU: 4 LoRA experts top-1 routed by router
+      conditioned on (mean tokens, op_embed). +280k params.
+    - AlphaEvolve-Godel population_size=4 every 2k steps
+    - 32-op vocabulary tagged per sample (math_gen_v2 ops, sudoku, CA, compose)
+
+Coming in v40.1: problem-level self_simulate + weighted TTA + MCTS hybrid.
+Coming in v40.2: CodeHead + CGAR PDC/HSW curriculum.
 
 Pulls source from https://github.com/PAMF2/oniro-colab (public).
 """
@@ -38,18 +41,22 @@ def code(text: str) -> dict:
 def main() -> None:
     cells = []
     cells.append(md(textwrap.dedent("""
-        # ONIRO v37 — Numeric-only, Vision+Number for ARC-AGI
+        # ONIRO v40.0 — Op-conditioning + MoL + Dual-encoder split
 
         **Setup:** Runtime → Change runtime type → **T4 GPU** → Save → Run All.
 
-        v37 upgrades over v36:
-        - **Numeric only**: dropped text head + math text Q/A
-        - **Dual encoder**: cell tokens (number) + patch tokens 3x3 (visual)
-        - **Socrates Loss** (arxiv:2604.12245) with UNKNOWN class for calibration
-        - **Cellular Automata** pretraining (Conway + B/S + rule110)
-        - **Multi-source ARC**: ARC-AGI-1/2 + RE-ARC + ConceptARC + Mini-ARC + BARC
-        - **TTA 128 samples** (vs 64 in v36)
-        - Retained: GQA + KV cache + EMA + RIMA + AlphaEvolve-Godel
+        v40.0 upgrades over v37.1:
+        - **Op-conditioning**: 32-op vocabulary, OpEmbedding token prepended to URM input
+        - **Dual-encoder split**: PatchEncoder (vision) for ARC tasks, MathPatchEncoder
+          (per-row numeric features) for math/sudoku/CA/compose
+        - **MoL (Mixture of LoRAs)**: 4 LoRA experts top-1 routed by (mean tokens, op_embed)
+          on ConvSwiGLU. +280k params, paper arxiv:2512.12880.
+        - **AlphaEvolve-Godel population_size=4** every 2k steps for ES expansion
+        - **Math-v2 (21 ops) tagged with op_id** so model learns each operation explicitly
+        - Retained from v37.1: GQA + KV cache + EMA + RIMA + Socrates Loss + 128-TTA
+
+        Coming in v40.1: problem-level self_simulate + MCTS hybrid.
+        Coming in v40.2: CodeHead + CGAR PDC/HSW curriculum.
 
         Runtime ~7-9h on Colab T4.
     """).strip()))
@@ -119,7 +126,7 @@ def main() -> None:
 
     cells.append(code("!pip -q install einops 2>&1 | tail -2"))
 
-    cells.append(md("## Build URM v37 (~21M params: 20M URM + 1M patch encoder)"))
+    cells.append(md("## Build URM v40.0 (~20.6M params: OpEmbed + dual encoder + MoL URM + Socrates decoder)"))
     cells.append(code(textwrap.dedent("""
         import time, json as _json, random
         import numpy as np
@@ -129,12 +136,15 @@ def main() -> None:
         from oniro.models.urm import URM
         from oniro.models.grid_token_encoder import GridTokenEncoder, GridTokenDecoder
         from oniro.models.patch_encoder import PatchEncoder
+        from oniro.models.math_patch_encoder import MathPatchEncoder
+        from oniro.models.op_embedding import OpEmbedding, OP_ID, N_OPS
         from oniro.losses.dis import make_dis_targets
         from oniro.losses.socrates import socrates_grid_ce, socrates_argmax
         from oniro.orchestrator.alphaevolve_godel import alphaevolve_godel_round, AlphaEvolveGodelArchive
         from oniro.data.arc_json_loader import load_arc_dir, flat_pairs, _pairs_from_task
         from oniro.data.sudoku_gen import gen_sudoku_pair
         from oniro.data.math_gen import gen_math_pair
+        from oniro.data.math_gen_v2 import gen_math_pair_v2, ALL_GENERATORS as MATH_V2_GENS
         from oniro.data.cellular_automata import gen_ca_pair
         from oniro.data.color_perm import random_color_perm, apply_color_perm
         from oniro.training.grpo import grpo_step, snapshot_policy
@@ -145,7 +155,7 @@ def main() -> None:
         if device == 'cpu':
             print('WARNING: GPU not active. Runtime → Change runtime type → T4 GPU')
 
-        # v37 config
+        # v40.0 config
         GRID = 30
         D = 768
         N_HEADS = 12
@@ -160,24 +170,34 @@ def main() -> None:
         PATCH_SIZE = 3
         BATCH = 8
 
-        # Cell + patch dual encoder
+        # MoL config
+        MOL_N_EXPERTS = 4
+        MOL_RANK = 16
+
+        # Dual-encoder split: vision (PatchEncoder) + math (MathPatchEncoder)
         cell_enc = GridTokenEncoder(grid_size=GRID, n_colors=N_COLORS, d_model=D).to(device)
-        patch_enc = PatchEncoder(grid_size=GRID, n_colors=N_COLORS,
-                                 patch_size=PATCH_SIZE, d_model=D).to(device)
+        patch_enc_vision = PatchEncoder(grid_size=GRID, n_colors=N_COLORS,
+                                        patch_size=PATCH_SIZE, d_model=D).to(device)
+        patch_enc_math = MathPatchEncoder(grid_size=GRID, n_colors=N_COLORS,
+                                          d_model=D, n_out_tokens=100).to(device)
+        op_embedding = OpEmbedding(n_ops=N_OPS, d_model=D).to(device)
+
+        # URM with MoL on ConvSwiGLU FFN
         urm = URM(d_model=D, n_heads=N_HEADS, n_kv_heads=N_KV_HEADS,
                   n_loops=N_LOOPS, n_forward_only=N_FORWARD_ONLY,
                   ffn_hidden=FFN, n_groups=N_GROUPS,
-                  kv_refresh_every=KV_REFRESH, use_rima=True).to(device)
-        # Decoder predicts 11 classes (10 colors + UNKNOWN). socrates_argmax strips
-        # UNKNOWN at inference, picking best real color.
+                  kv_refresh_every=KV_REFRESH, use_rima=True,
+                  use_mol=True, mol_n_experts=MOL_N_EXPERTS, mol_rank=MOL_RANK).to(device)
         decoder = GridTokenDecoder(d_model=D, n_colors=N_OUT_CLASSES).to(device)
 
-        all_params = (list(cell_enc.parameters()) + list(patch_enc.parameters())
-                      + list(urm.parameters()) + list(decoder.parameters()))
+        all_modules = [cell_enc, patch_enc_vision, patch_enc_math,
+                       op_embedding, urm, decoder]
+        all_params = [p for m in all_modules for p in m.parameters()]
         n_p = sum(p.numel() for p in all_params)
-        print(f'ONIRO v37: {n_p/1e6:.2f}M params (cell+patch enc + URM + Socrates decoder)')
+        print(f'ONIRO v40.0: {n_p/1e6:.2f}M params')
         print(f'  URM: D={D}, h={N_HEADS}/kv={N_KV_HEADS}, loops={N_LOOPS}/{N_GROUPS}grp, '
-              f'ffn={FFN}, grid={GRID}, patch={PATCH_SIZE}')
+              f'ffn={FFN}, MoL experts={MOL_N_EXPERTS} rank={MOL_RANK}')
+        print(f'  Dual encoder: vision_patch (ARC) + math_patch (non-ARC) + op token')
 
         def grid_to_fixed(grid_list, target_side=GRID):
             arr = np.asarray(grid_list, dtype=np.int64)
@@ -192,19 +212,27 @@ def main() -> None:
             canvas = np.clip(canvas, 0, N_COLORS - 1)
             return torch.from_numpy(canvas).long()
 
-        def encode_dual(g_int: torch.Tensor) -> torch.Tensor:
-            '''Concatenate patch tokens FIRST, then cell tokens.
+        def encode_v40(g_int: torch.Tensor,
+                       op_id: torch.Tensor,
+                       is_arc_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            '''Returns (urm_input_tokens, op_embed_token).
 
-            Critical: GridTokenDecoder reads the LAST grid_size*grid_size tokens
-            (assumes those are the test region). Keep cell tokens at the tail
-            so decoder picks them up. Patch tokens act as global visual context
-            at the front of the sequence.
+            Sequence: [op_token(1), patch_tokens(100), cell_tokens(900)] = 1001.
+            Patch tokens come from vision encoder for ARC samples (mask=1) and
+            from math encoder for non-ARC samples (mask=0). Vision and math
+            tokens are blended per-sample using arc_mask so a single batch
+            mixes the two pathways cleanly.
             '''
-            cell_out = cell_enc(g_int)               # (B, GRID*GRID, D)
-            patch_tok = patch_enc(g_int)              # (B, n_patches, D)
-            return torch.cat([patch_tok, cell_out['tokens']], dim=1)
+            cell_tok = cell_enc(g_int)['tokens']                  # (B, 900, D)
+            vis_tok = patch_enc_vision(g_int)                     # (B, 100, D)
+            math_tok = patch_enc_math(g_int)                      # (B, 100, D)
+            m = is_arc_mask.view(-1, 1, 1).to(vis_tok.dtype).to(vis_tok.device)
+            patch_tok = m * vis_tok + (1.0 - m) * math_tok        # blend per sample
+            op_tok = op_embedding(op_id)                          # (B, 1, D)
+            urm_input = torch.cat([op_tok, patch_tok, cell_tok], dim=1)  # (B, 1001, D)
+            return urm_input, op_tok
 
-        ema = EMA([cell_enc, patch_enc, urm, decoder], decay=0.999)
+        ema = EMA(all_modules, decay=0.999)
     """).strip()))
 
     cells.append(md("## Datasets: ARC train multi-source + procedural"))
@@ -263,26 +291,45 @@ def main() -> None:
                 g = np.flip(g, axis=1).copy()
             return g
 
-        # v37 mix - all numeric, no text
+        # v40.0 mix - ARC-1 heavy + math-v2 21-op + op_id per source
+        # is_arc flag routes the patch encoder pathway; op_id tags every sample.
+        # math_gen_v2 op_id is sampled inside the lambda per call (5..25).
+        def _math_v2_with_op():
+            fn = rng.choice(MATH_V2_GENS)
+            op_idx = MATH_V2_GENS.index(fn)
+            pair = fn(min(GRID, 16), rng)
+            return pair, OP_ID["MATH_ADD"] + op_idx  # ids 5..25
+
+        def _ca_with_op():
+            r = rng.random()
+            if r < 0.5:
+                pair = gen_ca_pair(rng=rng, side=min(GRID, 20))
+                return pair, OP_ID["CA_CONWAY"]
+            elif r < 0.8:
+                pair = gen_ca_pair(rng=rng, side=min(GRID, 20))
+                return pair, OP_ID["CA_BS"]
+            else:
+                pair = gen_ca_pair(rng=rng, side=min(GRID, 20))
+                return pair, OP_ID["CA_RULE110"]
+
         MIX_WEIGHTS = [
-            ('ARC-1',     0.18, lambda: sample_arc(ARC1_FILES)),
-            ('ARC-2',     0.22, lambda: sample_arc(ARC2_FILES)),
-            ('RE-ARC',    0.18, lambda: sample_arc(REARC_FILES)),
-            ('Concept',   0.06, lambda: sample_arc(CONCEPT_FILES)),
-            ('Mini',      0.04, lambda: sample_arc(MINI_FILES)),
-            ('Heavy',     0.08, lambda: sample_arc(HEAVY_FILES)),
-            ('Sudoku',    0.06, lambda: gen_sudoku_pair(mask_rate=0.4, rng=rng)),
-            ('Math',      0.04, lambda: gen_math_pair(side=min(GRID, 16), rng=rng)),
-            ('CA',        0.10, lambda: gen_ca_pair(rng=rng, side=min(GRID, 20))),
-            ('Compose',   0.04, lambda: _gen_dsl_compose()),
+            # (name, weight, is_arc, op_id, fn_returning (pair_or_None, op_id_override_or_None))
+            ('ARC-1',   0.25, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC1_FILES), None)),
+            ('RE-ARC',  0.20, True,  OP_ID["ARC_RE"],      lambda: (sample_arc(REARC_FILES), None)),
+            ('ARC-2',   0.15, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC2_FILES), None)),
+            ('Concept', 0.05, True,  OP_ID["ARC_CONCEPT"], lambda: (sample_arc(CONCEPT_FILES), None)),
+            ('Mini',    0.03, True,  OP_ID["ARC_MINI"],    lambda: (sample_arc(MINI_FILES), None)),
+            ('Heavy',   0.05, True,  OP_ID["ARC_HEAVY"],   lambda: (sample_arc(HEAVY_FILES), None)),
+            ('Math-v2', 0.15, False, None,                  lambda: _math_v2_with_op()),
+            ('Sudoku',  0.05, False, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None)),
+            ('CA',      0.05, False, None,                  lambda: _ca_with_op()),
+            ('Compose', 0.02, False, OP_ID["DSL_COMPOSE"],  lambda: (_gen_dsl_compose(), None)),
         ]
-        # normalize cumulative
         _cum = []
         s = 0.0
-        for nm, w, fn in MIX_WEIGHTS:
+        for nm, w, is_arc, op_default, fn in MIX_WEIGHTS:
             s += w
-            _cum.append((s, nm, fn))
-        # tail safety
+            _cum.append((s, nm, is_arc, op_default, fn))
         TOTAL_W = s
 
         def _gen_dsl_compose():
@@ -305,18 +352,21 @@ def main() -> None:
 
         def sample_one():
             r = rng.random() * TOTAL_W
-            for thresh, name, fn in _cum:
+            for thresh, name, is_arc, op_default, fn in _cum:
                 if r < thresh:
-                    item = fn()
-                    if item is None:
+                    pair, op_override = fn()
+                    if pair is None:
                         return sample_one()
-                    return item
-            return _cum[-1][2]()
+                    op_id = op_override if op_override is not None else op_default
+                    return pair, is_arc, op_id
+            # fallback (should not trigger)
+            pair, op_override = _cum[-1][4]()
+            return pair, _cum[-1][2], _cum[-1][3]
 
         def sample_batch(B, do_aug=True):
-            gi_, go_ = [], []
+            gi_, go_, arc_flags, op_ids = [], [], [], []
             for _ in range(B):
-                inp, out = sample_one()
+                (inp, out), is_arc, op_id = sample_one()
                 inp = np.asarray(inp, dtype=np.int64)
                 out = np.asarray(out, dtype=np.int64)
                 if do_aug:
@@ -330,10 +380,16 @@ def main() -> None:
                         out = apply_color_perm(out, cp)
                 gi_.append(grid_to_fixed(inp))
                 go_.append(grid_to_fixed(out))
-            return torch.stack(gi_).to(device), torch.stack(go_).to(device)
+                arc_flags.append(1.0 if is_arc else 0.0)
+                op_ids.append(int(op_id))
+            return (torch.stack(gi_).to(device),
+                    torch.stack(go_).to(device),
+                    torch.tensor(arc_flags, dtype=torch.float, device=device),
+                    torch.tensor(op_ids, dtype=torch.long, device=device))
 
-        g_in, g_out = sample_batch(4)
-        print('sample shapes:', g_in.shape, g_out.shape)
+        g_in, g_out, arc_mask, op_id = sample_batch(4)
+        print('sample shapes:', g_in.shape, g_out.shape,
+              'arc_mask:', arc_mask.tolist(), 'op_ids:', op_id.tolist())
     """).strip()))
 
     cells.append(md("## Train: Socrates + dual encoder + AE-Godel"))
@@ -354,11 +410,14 @@ def main() -> None:
         ae_archive = AlphaEvolveGodelArchive()
         AE_EVERY = 2000
 
+        # MoL load-balance loss weight (small to avoid dominating)
+        MOL_LB_WEIGHT = 0.01
+
         t0 = time.time()
         for step in range(STEPS):
-            g_in, g_out = sample_batch(BATCH)
-            tokens = encode_dual(g_in)              # (B, 1000, D)
-            urm_out = urm(tokens)
+            g_in, g_out, arc_mask, op_id = sample_batch(BATCH)
+            urm_input, op_tok = encode_v40(g_in, op_id, arc_mask)   # (B, 1001, D), (B, 1, D)
+            urm_out = urm(urm_input, op_embed=op_tok)
 
             loss = torch.zeros((), device=device)
             n_states = len(urm_out['states_per_loop'])
@@ -366,13 +425,20 @@ def main() -> None:
                                             n_colors=N_COLORS, max_corruption=0.5,
                                             seed=step)
             for t, state in enumerate(urm_out['states_per_loop'][1:]):
-                logits = decoder(state, GRID)        # (B, N_OUT_CLASSES, GRID, GRID)
+                logits = decoder(state, GRID)
                 tgt = dis_targets[t].to(device)
                 weight = 1.5 ** (-(n_states - 2 - t))
                 loss = loss + weight * socrates_grid_ce(
                     logits, tgt, n_colors=N_COLORS,
                     unknown_class=N_COLORS, gamma=0.05, bg_weight=0.15
                 )
+
+            # MoL load-balance aux loss (sum over all blocks)
+            lb_loss = torch.zeros((), device=device)
+            for blk in urm.blocks:
+                if blk.use_mol:
+                    lb_loss = lb_loss + blk.ffn.load_balance_loss().to(device)
+            loss = loss + MOL_LB_WEIGHT * lb_loss
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -389,53 +455,73 @@ def main() -> None:
                                             unknown_class=N_COLORS)
                     cell_acc = (pred == g_out).float().mean().item()
                 lr_cur = sched.get_last_lr()[0]
+                # show MoL expert usage histogram for the last block
+                last_usage = urm.blocks[-1].ffn.last_expert_usage if urm.blocks[-1].use_mol else None
+                usage_str = f'  mol={[round(float(u), 2) for u in last_usage.tolist()]}' if last_usage is not None else ''
                 print(f'step {step:5d}  loss={float(loss.detach()):.4f}  '
-                      f'cell_acc={cell_acc:.3f}  lr={lr_cur:.2e}  '
-                      f'rate={(step+1)/max(dt,1):.1f}/s')
+                      f'lb={float(lb_loss.detach()):.4f}  cell_acc={cell_acc:.3f}  '
+                      f'lr={lr_cur:.2e}  rate={(step+1)/max(dt,1):.1f}/s{usage_str}')
 
             if step > 0 and step % AE_EVERY == 0:
-                cell_enc.eval(); patch_enc.eval(); urm.eval(); decoder.eval()
-                eval_in, eval_out = sample_batch(BATCH, do_aug=False)
+                for m in all_modules: m.eval()
+                eval_in, eval_out, eval_arc, eval_op = sample_batch(BATCH, do_aug=False)
                 def ae_score():
                     with torch.no_grad():
-                        t_ = encode_dual(eval_in)
-                        u = urm(t_)
+                        t_, op_t = encode_v40(eval_in, eval_op, eval_arc)
+                        u = urm(t_, op_embed=op_t)
                         l = decoder(u['final_state'], GRID)
                         p = socrates_argmax(l, n_colors=N_COLORS, unknown_class=N_COLORS)
                         return float((p == eval_out).float().mean().item())
                 acc, base, best, ae_archive = alphaevolve_godel_round(
-                    urm, ae_score, n_candidates=3, sigma=2e-3, archive=ae_archive,
+                    urm, ae_score, n_candidates=3, sigma=2e-3,
+                    population_size=4,  # v40.0: ES expansion
+                    archive=ae_archive,
                 )
-                print(f'  [AE] base={base:.4f} best={best:.4f} accept={acc} reject={ae_archive.rejected}')
-                cell_enc.train(); patch_enc.train(); urm.train(); decoder.train()
+                print(f'  [AE pop=4] base={base:.4f} best={best:.4f} accept={acc} reject={ae_archive.rejected}')
+                for m in all_modules: m.train()
 
         print(f'\\nphase A (supervised) done in {(time.time()-t0)/60:.1f}min')
 
         # ============= Phase B: GRPO RL =============
         print(f'\\n=== Phase B: GRPO RL ({GRPO_STEPS} steps, group=4) ===')
 
-        # Adapter to keep GRPO API (which expects encoder, urm, decoder) working with dual encoder.
-        class DualEncoderAdapter(torch.nn.Module):
-            def __init__(self, cell, patch):
+        # Adapter for GRPO API. For RL phase, the GRPO step does not have a
+        # per-sample op_id signal, so we default everything to ARC_GENERIC (id 0)
+        # and assume vision pathway. URM still uses MoL but with a constant op_embed.
+        class V40EncoderAdapter(torch.nn.Module):
+            def __init__(self, cell, vis_patch, math_patch, op_emb):
                 super().__init__()
                 self.cell = cell
-                self.patch = patch
+                self.vis_patch = vis_patch
+                self.math_patch = math_patch
+                self.op_emb = op_emb
             def forward(self, g):
-                co = self.cell(g)
-                pt = self.patch(g)
-                # patch first, cell last - decoder reads last GRID*GRID tokens
-                return {'tokens': torch.cat([pt, co['tokens']], dim=1)}
+                co = self.cell(g)['tokens']
+                pt = self.vis_patch(g)
+                B = g.shape[0]
+                op_id = torch.zeros(B, dtype=torch.long, device=g.device)
+                op_tok = self.op_emb(op_id)
+                return {'tokens': torch.cat([op_tok, pt, co], dim=1),
+                        'op_embed': op_tok}
 
-        enc_adapter = DualEncoderAdapter(cell_enc, patch_enc).to(device)
+        enc_adapter = V40EncoderAdapter(cell_enc, patch_enc_vision,
+                                         patch_enc_math, op_embedding).to(device)
         ref_enc, ref_urm, ref_dec = snapshot_policy(enc_adapter, urm, decoder)
         for p in ref_enc.parameters(): p.requires_grad = False
         for p in ref_urm.parameters(): p.requires_grad = False
         for p in ref_dec.parameters(): p.requires_grad = False
         ref_enc.to(device); ref_urm.to(device); ref_dec.to(device)
 
-        rl_opt = torch.optim.AdamW(all_params, lr=3e-5, weight_decay=0.05)
+        # RL phase only touches grid trunk parameters
+        rl_trunk_params = (list(cell_enc.parameters())
+                            + list(patch_enc_vision.parameters())
+                            + list(patch_enc_math.parameters())
+                            + list(op_embedding.parameters())
+                            + list(urm.parameters())
+                            + list(decoder.parameters()))
+        rl_opt = torch.optim.AdamW(rl_trunk_params, lr=3e-5, weight_decay=0.05)
         for rl_step in range(GRPO_STEPS):
-            g_in_b, g_out_b = sample_batch(BATCH, do_aug=False)
+            g_in_b, g_out_b, _rl_arc, _rl_op = sample_batch(BATCH, do_aug=False)
             r = grpo_step(enc_adapter, urm, decoder, rl_opt, g_in_b, g_out_b,
                           ref_enc, ref_urm, ref_dec,
                           n_group=4, eps_clip=0.2, kl_beta=0.04,
@@ -455,17 +541,23 @@ def main() -> None:
         ckpt_dir = ROOT / 'checkpoints'
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         torch.save({'cell_enc': cell_enc.state_dict(),
-                    'patch_enc': patch_enc.state_dict(),
+                    'patch_enc_vision': patch_enc_vision.state_dict(),
+                    'patch_enc_math': patch_enc_math.state_dict(),
+                    'op_embedding': op_embedding.state_dict(),
                     'urm': urm.state_dict(),
                     'decoder': decoder.state_dict()},
-                   str(ckpt_dir / 'urm_v37_final.pt'))
+                   str(ckpt_dir / 'urm_v40_0_final.pt'))
     """).strip()))
 
-    cells.append(md("## ARC eval — 128-sample TTA majority vote (Socrates argmax)"))
+    cells.append(md("## ARC eval — 128-sample TTA majority vote (Socrates argmax + op_id=ARC_GENERIC)"))
     cells.append(code(textwrap.dedent("""
-        cell_enc.eval(); patch_enc.eval(); urm.eval(); decoder.eval()
+        for m in all_modules: m.eval()
 
         N_TTA = int(os.environ.get('ONIRO_TTA', '128'))
+
+        # Eval defaults: op_id=ARC_GENERIC (id 0), is_arc=True (vision pathway).
+        EVAL_OP_ID = torch.tensor([OP_ID["ARC_GENERIC"]], dtype=torch.long, device=device)
+        EVAL_ARC_MASK = torch.tensor([1.0], dtype=torch.float, device=device)
 
         @torch.no_grad()
         def tta_majority_vote(grid_int_t, n_samples=N_TTA):
@@ -478,8 +570,8 @@ def main() -> None:
                 gaug = dihedral_aug(gnp, k, flip)
                 gaug = apply_color_perm(gaug, cp)
                 t = grid_to_fixed(gaug).unsqueeze(0).to(device)
-                tokens = encode_dual(t)
-                u = urm(tokens)
+                urm_input, op_tok = encode_v40(t, EVAL_OP_ID, EVAL_ARC_MASK)
+                u = urm(urm_input, op_embed=op_tok)
                 l = decoder(u['final_state'], GRID)
                 pred = socrates_argmax(l, n_colors=N_COLORS, unknown_class=N_COLORS)[0]
                 pred_np = pred.cpu().numpy()
@@ -538,7 +630,8 @@ def main() -> None:
         @torch.no_grad()
         def neural_predict_np(grid_np):
             gi = grid_to_fixed(grid_np.tolist()).unsqueeze(0).to(device)
-            t = encode_dual(gi); u = urm(t)
+            urm_input, op_tok = encode_v40(gi, EVAL_OP_ID, EVAL_ARC_MASK)
+            u = urm(urm_input, op_embed=op_tok)
             l = decoder(u['final_state'], GRID)
             return socrates_argmax(l, n_colors=N_COLORS, unknown_class=N_COLORS)[0].cpu().numpy().astype(np.int8)
 
@@ -586,11 +679,15 @@ def main() -> None:
         results['arc2_hybrid'] = eval_arc_hybrid(ARC2_ROOT, 'ARC-2', max_dsl_depth=3)
         print(_json.dumps(results['arc2_hybrid'], indent=2))
 
-        # Procedural quick eval
+        # Procedural quick eval (uses op_id=ARC_GENERIC and vision pathway for now;
+        # v40.1 will route procedural eval through op_id-aware path).
         @torch.no_grad()
         def predict_grid_t(g_t):
-            tokens = encode_dual(g_t)
-            u = urm(tokens)
+            B = g_t.shape[0]
+            op_id_eval = torch.full((B,), OP_ID["ARC_GENERIC"], dtype=torch.long, device=device)
+            arc_mask_eval = torch.ones(B, dtype=torch.float, device=device)
+            urm_input, op_tok = encode_v40(g_t, op_id_eval, arc_mask_eval)
+            u = urm(urm_input, op_embed=op_tok)
             l = decoder(u['final_state'], GRID)
             return socrates_argmax(l, n_colors=N_COLORS, unknown_class=N_COLORS)[0]
 
