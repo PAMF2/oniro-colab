@@ -263,8 +263,9 @@ def main() -> None:
                    str(ckpt_dir / 'urm_micro_rl_final.pt'))
     """).strip()))
 
-    cells.append(md("## Eval: ARC-1, ARC-2, Sudoku, Math"))
+    cells.append(md("## Eval: ARC-1, ARC-2 (TTFT + AIRV), Sudoku, Math"))
     cells.append(code(textwrap.dedent("""
+        from oniro.eval.ttft_urm import ttft_finetune_urm, restore_urm, airv_predict
         encoder.eval(); urm.eval(); decoder.eval()
 
         @torch.no_grad()
@@ -274,19 +275,41 @@ def main() -> None:
             l = decoder(u['final_state'], GRID)
             return l.argmax(dim=1)[0]
 
+        TTFT_STEPS = int(os.environ.get('ONIRO_TTFT_STEPS', '20'))
+        TTFT_LR = float(os.environ.get('ONIRO_TTFT_LR', '1e-4'))
+        USE_AIRV = os.environ.get('ONIRO_AIRV', '1') == '1'
+
+        def predict_with_ttft_airv(task, test_input_grid_int):
+            demos = []
+            for tp in task.get('train', []):
+                di = grid_to_fixed(tp['input']).unsqueeze(0).to(device)
+                do = grid_to_fixed(tp['output']).unsqueeze(0).to(device)
+                demos.append((di, do))
+            snap = ttft_finetune_urm(encoder, urm, decoder, demos,
+                                     grid_size=GRID, n_steps=TTFT_STEPS,
+                                     lr=TTFT_LR, device=device)
+            if USE_AIRV:
+                pred = airv_predict(encoder, urm, decoder,
+                                     test_input_grid_int.unsqueeze(0),
+                                     grid_size=GRID, n_colors=N_COLORS)
+            else:
+                pred = predict(test_input_grid_int.unsqueeze(0))
+            restore_urm(encoder, urm, decoder, snap)
+            return pred
+
         def eval_arc(root, label):
             sd = Path(root) / 'evaluation'
             files = sorted(sd.glob('*.json'))
             n_pe = 0; n_t = 0; cells_c = []; ts = 0; tt = 0
-            for tf in files:
+            for ti, tf in enumerate(files):
                 with tf.open() as f:
                     task = _json.load(f)
                 solved = []
                 for tp in task.get('test', []):
                     if 'output' not in tp: continue
-                    gi = grid_to_fixed(tp['input']).unsqueeze(0).to(device)
+                    gi = grid_to_fixed(tp['input']).to(device)
                     gt = grid_to_fixed(tp['output']).to(device)
-                    pred = predict(gi)
+                    pred = predict_with_ttft_airv(task, gi)
                     exact = bool((pred == gt).all().item())
                     n_t += 1
                     if exact: n_pe += 1
@@ -295,11 +318,14 @@ def main() -> None:
                 if solved:
                     tt += 1
                     if all(solved): ts += 1
+                if (ti + 1) % 30 == 0:
+                    print(f'  {label} [{ti+1}/{len(files)}] exact={n_pe}/{n_t}')
             return {'label': label, 'pairs_total': n_t, 'pairs_exact': n_pe,
                     'pair_exact_acc': n_pe / max(n_t, 1),
                     'mean_cell_acc': sum(cells_c)/max(len(cells_c), 1),
                     'tasks_total': tt, 'tasks_solved': ts,
-                    'task_acc': ts / max(tt, 1)}
+                    'task_acc': ts / max(tt, 1),
+                    'ttft_steps': TTFT_STEPS, 'airv': USE_AIRV}
 
         results = {}
         print('=== ARC-AGI-1 ===')
