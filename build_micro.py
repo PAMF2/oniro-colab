@@ -617,7 +617,9 @@ def main() -> None:
         AE_EVERY = 2000
 
         # v40.2 aux loss weights
-        MOL_LB_WEIGHT = 0.01
+        # v40.10: MoL router was collapsing to one expert (mol=[0,0,1,0]).
+        # Bump LB weight 10x so the variance penalty actually breaks symmetry.
+        MOL_LB_WEIGHT = 0.10
         CODE_HEAD_WEIGHT = 0.05
 
         # v40.7+ fp16 autocast on CUDA. Use the older torch.cuda.amp namespace
