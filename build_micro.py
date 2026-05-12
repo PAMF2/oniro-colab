@@ -109,13 +109,13 @@ def main() -> None:
         if device == 'cpu':
             print('WARNING: GPU not active. Runtime → Change runtime type → T4 GPU')
 
-        GRID = 12
-        D = 96
+        GRID = 14
+        D = 128
         N_HEADS = 4
-        N_LOOPS = 6
-        N_FORWARD_ONLY = 1
+        N_LOOPS = 8
+        N_FORWARD_ONLY = 2
         N_COLORS = 10
-        BATCH = 32
+        BATCH = 24
 
         encoder = GridTokenEncoder(grid_size=GRID, n_colors=N_COLORS, d_model=D).to(device)
         urm = URM(d_model=D, n_heads=N_HEADS, n_loops=N_LOOPS,
@@ -177,8 +177,8 @@ def main() -> None:
     """).strip()))
 
     cells.append(code(textwrap.dedent("""
-        STEPS = int(os.environ.get('ONIRO_STEPS', '15000'))
-        GRPO_STEPS = int(os.environ.get('ONIRO_GRPO_STEPS', '3000'))
+        STEPS = int(os.environ.get('ONIRO_STEPS', '25000'))
+        GRPO_STEPS = int(os.environ.get('ONIRO_GRPO_STEPS', '5000'))
         opt = torch.optim.AdamW(all_params, lr=3e-4, weight_decay=0.05)
         ae_archive = AlphaEvolveGodelArchive()
         AE_EVERY = 1000
@@ -275,7 +275,7 @@ def main() -> None:
             l = decoder(u['final_state'], GRID)
             return l.argmax(dim=1)[0]
 
-        TTFT_STEPS = int(os.environ.get('ONIRO_TTFT_STEPS', '20'))
+        TTFT_STEPS = int(os.environ.get('ONIRO_TTFT_STEPS', '50'))
         TTFT_LR = float(os.environ.get('ONIRO_TTFT_LR', '1e-4'))
         USE_AIRV = os.environ.get('ONIRO_AIRV', '1') == '1'
 
