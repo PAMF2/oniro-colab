@@ -299,17 +299,18 @@ def main() -> None:
         MINI_FILES    = list((NEONEYE_DIR / 'dataset' / 'Mini-ARC').rglob('*.json'))
         HEAVY_FILES   = list((NEONEYE_DIR / 'dataset' / 'ARC-Heavy').rglob('*.json'))
 
-        # RE-ARC: tasks_train_re-arc has 1000 pairs per ARC-1 task (or any json with pairs)
+        # RE-ARC stores per-task JSON in re_arc/tasks/ as a FLAT LIST of
+        # pairs [{"input", "output"}, ...] (no train/test split). The
+        # patched _pairs_from_task in arc_json_loader handles this format.
         REARC_FILES = list(Path(REARC_ROOT).rglob('*.json'))
-        # Filter to those that contain ARC-format keys
-        def _has_arc_format(p):
+        def _has_pairs(p):
             try:
                 with p.open() as f:
                     t = _json.load(f)
-                return isinstance(t, dict) and ('train' in t or 'test' in t)
+                return len(_pairs_from_task(t)) > 0
             except Exception:
                 return False
-        REARC_FILES = [p for p in REARC_FILES if _has_arc_format(p)]
+        REARC_FILES = [p for p in REARC_FILES if _has_pairs(p)]
 
         print(f'ARC1 tasks: {len(ARC1_FILES)}')
         print(f'ARC2 tasks: {len(ARC2_FILES)}')
@@ -381,26 +382,53 @@ def main() -> None:
         ARCGEN_FILES = arcgen_files if 'arcgen_files' in dir() else []
         ENIGMATA_FILES = enigmata_files if 'enigmata_files' in dir() else []
         ENIGMATA_OP_ID = OP_ID["MATH_ARITH_CHAIN"]   # logic/grid puzzles
-        # BARC + H-ARC repo clones (v40.4)
-        BARC_DIR = ROOT / 'BARC'
+        # v40.5: corrected dataset sources
+        # BARC actual data is on HuggingFace (barc0); the GitHub repo only ships
+        # the synthesis pipeline (Python seeds, not JSON tasks). We try HF Hub
+        # but fall back to empty if `datasets` is not installed.
+        # H-ARC correct URL is github.com/le-gris/h-arc per arxiv:2409.01374.
+        # We also add neoneye/arc-dataset-tama as a large auxiliary ARC-format
+        # source.
+        BARC_DIR = ROOT / 'BARC-hf'
         HARC_DIR = ROOT / 'H-ARC'
+        TAMA_DIR = ROOT / 'arc-dataset-tama'
+
+        BARC_FILES = []
+        # BARC via HuggingFace (best-effort)
         if not BARC_DIR.exists():
             try:
-                subprocess.check_call(['git','clone','--depth','1','--filter=blob:none','--sparse',
-                    'https://github.com/xu3kev/BARC.git', str(BARC_DIR)])
-                subprocess.check_call(['git','-C',str(BARC_DIR),'sparse-checkout','set','seeds'])
+                subprocess.check_call(['pip', '-q', 'install', 'huggingface_hub'])
+                from huggingface_hub import snapshot_download
+                snapshot_download(repo_id="barc0/100k_yes_promptv2_problems_with_descriptions",
+                                  repo_type="dataset", local_dir=str(BARC_DIR))
             except Exception as e:
-                print(f'BARC clone failed (will run without): {e}')
+                print(f'BARC HF download failed (will run without): {e}')
+                BARC_DIR.mkdir(exist_ok=True)
+        if BARC_DIR.exists():
+            # HF datasets may use .jsonl or parquet; try both
+            BARC_FILES = (list(BARC_DIR.rglob('*.json'))
+                          + list(BARC_DIR.rglob('*.jsonl')))
+
+        # H-ARC (le-gris/h-arc) - source code; actual data on OSF (zip)
         if not HARC_DIR.exists():
             try:
-                # Best-effort: H-ARC distribution varies; this is a placeholder
-                subprocess.check_call(['git','clone','--depth','1','--filter=blob:none','--sparse',
-                    'https://github.com/arc-visualizations/h-arc.git', str(HARC_DIR)])
+                subprocess.check_call(['git','clone','--depth','1',
+                    'https://github.com/le-gris/h-arc.git', str(HARC_DIR)])
             except Exception as e:
                 print(f'H-ARC clone failed (will run without): {e}')
-        BARC_FILES = list(BARC_DIR.rglob('*.json')) if BARC_DIR.exists() else []
         HARC_FILES = list(HARC_DIR.rglob('*.json')) if HARC_DIR.exists() else []
-        print(f'BARC files: {len(BARC_FILES)}, H-ARC files: {len(HARC_FILES)}')
+
+        # neoneye/arc-dataset-tama (Big ARC tasks, standard ARC JSON format)
+        if not TAMA_DIR.exists():
+            try:
+                subprocess.check_call(['git','clone','--depth','1',
+                    'https://github.com/neoneye/arc-dataset-tama.git', str(TAMA_DIR)])
+            except Exception as e:
+                print(f'arc-dataset-tama clone failed (will run without): {e}')
+        TAMA_FILES = list(TAMA_DIR.rglob('*.json')) if TAMA_DIR.exists() else []
+
+        print(f'BARC files: {len(BARC_FILES)}, H-ARC files: {len(HARC_FILES)}, '
+              f'arc-dataset-tama files: {len(TAMA_FILES)}')
 
         # arc_mask_default is FLOAT in [0, 1]. 1.0 = pure vision pathway,
         # 0.0 = pure math pathway, 0.5 = blend both (geometry / hybrid).
@@ -414,8 +442,10 @@ def main() -> None:
             ('Concept',   0.04, 1.0, OP_ID["ARC_CONCEPT"], lambda: (sample_arc(CONCEPT_FILES), None, None, None)),
             ('Mini',      0.02, 1.0, OP_ID["ARC_MINI"],    lambda: (sample_arc(MINI_FILES), None, None, None)),
             ('Heavy',     0.04, 1.0, OP_ID["ARC_HEAVY"],   lambda: (sample_arc(HEAVY_FILES), None, None, None)),
-            # BARC (v40.4 add): synthetic from GPT, hybrid because of mixed quality
+            # BARC HF (v40.5 fixed source): synthetic from GPT, vision pathway
             ('BARC',      0.04, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(BARC_FILES), None, None, None)),
+            # arc-dataset-tama: big ARC-format synthetic pool (v40.5 add)
+            ('Tama',      0.04, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(TAMA_FILES), None, None, None)),
             # Math-v2: per-op arc_mask decided inside (0.0 pure / 0.5 spatial)
             ('Math-v2',   0.10, 0.0, None,                  _math_v2_with_op),
             ('Enigmata',  0.06, 0.5, ENIGMATA_OP_ID,        lambda: (sample_arc(ENIGMATA_FILES), None, None, None)),
@@ -423,7 +453,7 @@ def main() -> None:
             ('Sudoku',    0.04, 0.5, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None, None, None)),
             ('CA',        0.04, 0.5, None,                  _ca_with_op),
             ('Compose',   0.02, 0.5, OP_ID["DSL_COMPOSE"],  _compose_with_program),
-            # H-ARC (v40.4 add): human traces, vision pathway
+            # H-ARC (v40.5 fixed URL): human traces, vision pathway
             ('H-ARC',     0.02, 1.0, OP_ID["ARC_GENERIC"], lambda: (sample_arc(HARC_FILES), None, None, None)),
         ]
         _cum = []

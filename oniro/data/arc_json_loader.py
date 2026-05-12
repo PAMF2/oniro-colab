@@ -17,17 +17,44 @@ from pathlib import Path
 import numpy as np
 
 
-def _pairs_from_task(task: dict) -> list[tuple[np.ndarray, np.ndarray]]:
-    out = []
-    for section in ("train", "test"):
-        for p in task.get(section, []):
+def _pairs_from_task(task) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Tolerant pair extractor.
+
+    Accepts THREE on-disk shapes:
+      1. Standard ARC: {"train": [{"input", "output"}, ...], "test": [...]}.
+      2. RE-ARC: a flat list of pairs [{"input", "output"}, ...] (no train/test split).
+      3. BARC HF format inside JSON: {"examples": [{"input", "output"}, ...]}.
+    Returns: list[(inp_np, out_np)] always as 2D int64 arrays. Items that
+    fail shape/key checks are silently dropped.
+    """
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def _take(items):
+        for p in items:
+            if not isinstance(p, dict):
+                continue
             if "input" not in p or "output" not in p:
                 continue
-            inp = np.asarray(p["input"], dtype=np.int64)
-            outp = np.asarray(p["output"], dtype=np.int64)
+            try:
+                inp = np.asarray(p["input"], dtype=np.int64)
+                outp = np.asarray(p["output"], dtype=np.int64)
+            except Exception:
+                continue
             if inp.ndim != 2 or outp.ndim != 2:
                 continue
             out.append((inp, outp))
+
+    if isinstance(task, list):
+        # RE-ARC: flat array of pairs
+        _take(task)
+    elif isinstance(task, dict):
+        # ARC standard: train + test sections
+        if "train" in task or "test" in task:
+            for section in ("train", "test"):
+                _take(task.get(section, []))
+        # BARC / other: top-level "examples"
+        if "examples" in task:
+            _take(task["examples"])
     return out
 
 
