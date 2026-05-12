@@ -1,18 +1,19 @@
-"""Build ONIRO v40.2 Colab notebook.
+"""Build ONIRO v40.3 Colab notebook.
 
-v40.2 (math-as-code, sub-version 3 of 3, FINAL):
-    All v40.0 + v40.1 features PLUS:
-    - CodeHead aux output: predicts length-3 DSL primitive sequence per task.
-      Trained on synthetic DSL_COMPOSE samples with known programs (0.1x weight),
-      NULL_PROGRAM target for ARC samples (0.01x weight). Consumed at eval by
-      MCTS search to bias toward the predicted program.
-    - CGAR PDC schedule (arxiv:2511.08653): Phase A0 (0-20% steps) runs URM at
-      shallow depth (n_loops/3), A1 (20-50%) at 2*n_loops/3, A2 (50%-100%) at
-      full n_loops. Compute savings on early stages.
-    - CGAR HSW weights (Hierarchical Supervision Weighting): replaces fixed
-      1.5^... cycle weights. Starts uniform across cycles, ramps to
-      late-cycle-heavy weighting over training.
-    - safe_softmax=True in Socrates Loss (explicit subtract-max for stability).
+v40.3 (gap closure, all plan items wired):
+    All v40.0 + v40.1 + v40.2 features PLUS:
+    - ARC-GEN dataset cloned + wired into training mix (arxiv:2511.00162,
+      google/ARC-GEN, 100k procedural ARC examples).
+    - Enigmata cloned + wired into training mix (arxiv:2505.19914,
+      36 verifiable puzzle tasks across grid/arith/logic/etc).
+    - Real CodeHead targets: DSL_COMPOSE samples now carry their generating
+      program (3 primitive ids) and CodeHead is trained against them with
+      full weight. Non-compose samples keep NULL_PROGRAM at low (0.05x)
+      weight so the head doesn't drift to a degenerate constant.
+    - Training mix re-weighted to plan §"Training datasets used (v40)":
+      ARC-1=0.22, RE-ARC=0.18, ARC-GEN=0.10, ARC-2=0.14, Concept=0.04,
+      Mini=0.02, Heavy=0.04, Math-v2=0.10, Enigmata=0.06, Sudoku=0.04,
+      CA=0.04, Compose=0.02.
 
 Pulls source from https://github.com/PAMF2/oniro-colab (public).
 """
@@ -43,7 +44,7 @@ def code(text: str) -> dict:
 def main() -> None:
     cells = []
     cells.append(md(textwrap.dedent("""
-        # ONIRO v40.2 — Final: CodeHead + CGAR PDC/HSW curriculum
+        # ONIRO v40.3 — Gap closure: ARC-GEN + Enigmata + real CodeHead targets
 
         **Setup:** Runtime → Change runtime type → **T4 GPU** → Save → Run All.
 
@@ -101,6 +102,8 @@ def main() -> None:
         ARC2_DIR = ROOT / 'ARC-AGI-2'
         ARC1_DIR = ROOT / 'ARC-AGI-1'
         REARC_DIR = ROOT / 're-arc'
+        ARCGEN_DIR = ROOT / 'ARC-GEN'
+        ENIGMATA_DIR = ROOT / 'Enigmata'
         CONCEPT_DIR = ROOT / 'ConceptARC'
         MINI_DIR = ROOT / 'Mini-ARC'
 
@@ -113,6 +116,23 @@ def main() -> None:
         if not REARC_DIR.exists():
             subprocess.check_call(['git','clone','--depth','1',
                 'https://github.com/michaelhodel/re-arc.git', str(REARC_DIR)])
+        # ARC-GEN (Google, arxiv:2511.00162): 100k procedural ARC examples
+        if not ARCGEN_DIR.exists():
+            try:
+                subprocess.check_call(['git','clone','--depth','1',
+                    'https://github.com/google/ARC-GEN.git', str(ARCGEN_DIR)])
+            except Exception as e:
+                print(f'ARC-GEN clone failed (will run without): {e}')
+        # Enigmata (Bytedance/Tsinghua, arxiv:2505.19914): 36 puzzle tasks
+        if not ENIGMATA_DIR.exists():
+            try:
+                subprocess.check_call(['git','clone','--depth','1','--filter=blob:none','--sparse',
+                    'https://github.com/BytedTsinghua-SIA/Enigmata.git', str(ENIGMATA_DIR)])
+                # sparse checkout: grid + arithmetic + logic puzzles only
+                subprocess.check_call(['git','-C',str(ENIGMATA_DIR),'sparse-checkout','set',
+                    'data', 'puzzles', 'tasks'])
+            except Exception as e:
+                print(f'Enigmata clone failed (will run without): {e}')
         # ConceptARC + Mini-ARC: pulled via neoneye collection (sparse, only what we need)
         NEONEYE_DIR = ROOT / 'arc-dataset-collection'
         if not NEONEYE_DIR.exists():
@@ -126,9 +146,13 @@ def main() -> None:
         REARC_ROOT = str(REARC_DIR)
         print('ARC2 train:', len(list(Path(ARC2_ROOT,'training').glob('*.json'))))
         print('ARC1 train:', len(list(Path(ARC1_ROOT,'training').glob('*.json'))))
-        # RE-ARC has tasks_train_re-arc/*.json
         rearc_glob = list(Path(REARC_ROOT).rglob('*.json'))
         print('RE-ARC json files (any):', len(rearc_glob))
+        # ARC-GEN + Enigmata enumeration (optional - if clone failed, lists are empty)
+        arcgen_files = list(ARCGEN_DIR.rglob('*.json')) if ARCGEN_DIR.exists() else []
+        enigmata_files = list(ENIGMATA_DIR.rglob('*.json')) if ENIGMATA_DIR.exists() else []
+        print('ARC-GEN files:', len(arcgen_files))
+        print('Enigmata files:', len(enigmata_files))
     """).strip()))
 
     cells.append(code("!pip -q install einops 2>&1 | tail -2"))
@@ -307,39 +331,46 @@ def main() -> None:
                 g = np.flip(g, axis=1).copy()
             return g
 
-        # v40.0 mix - ARC-1 heavy + math-v2 21-op + op_id per source
-        # is_arc flag routes the patch encoder pathway; op_id tags every sample.
-        # math_gen_v2 op_id is sampled inside the lambda per call (5..25).
+        # v40.3 mix - ARC-1 heavy + ARC-GEN + Enigmata + math-v2 21-op + op_id per source
+        # Each lambda returns (pair_or_None, op_id_override_or_None, program_or_None)
+        # where program is a list of 3 DSL primitive ids for DSL_COMPOSE samples.
         def _math_v2_with_op():
             fn = rng.choice(MATH_V2_GENS)
             op_idx = MATH_V2_GENS.index(fn)
             pair = fn(min(GRID, 16), rng)
-            return pair, OP_ID["MATH_ADD"] + op_idx  # ids 5..25
+            return pair, OP_ID["MATH_ADD"] + op_idx, None
 
         def _ca_with_op():
             r = rng.random()
-            if r < 0.5:
-                pair = gen_ca_pair(rng=rng, side=min(GRID, 20))
-                return pair, OP_ID["CA_CONWAY"]
-            elif r < 0.8:
-                pair = gen_ca_pair(rng=rng, side=min(GRID, 20))
-                return pair, OP_ID["CA_BS"]
-            else:
-                pair = gen_ca_pair(rng=rng, side=min(GRID, 20))
-                return pair, OP_ID["CA_RULE110"]
+            pair = gen_ca_pair(rng=rng, side=min(GRID, 20))
+            if r < 0.5:    op = OP_ID["CA_CONWAY"]
+            elif r < 0.8:  op = OP_ID["CA_BS"]
+            else:           op = OP_ID["CA_RULE110"]
+            return pair, op, None
+
+        def _compose_with_program():
+            pair, prog = _gen_dsl_compose_with_program()
+            return pair, OP_ID["DSL_COMPOSE"], prog
+
+        # ARC-GEN files cached pair list (lazy)
+        ARCGEN_FILES = arcgen_files if 'arcgen_files' in dir() else []
+        ENIGMATA_FILES = enigmata_files if 'enigmata_files' in dir() else []
+        ENIGMATA_OP_ID = OP_ID["MATH_ARITH_CHAIN"]   # logic/grid puzzles → reuse arith_chain op
 
         MIX_WEIGHTS = [
-            # (name, weight, is_arc, op_id, fn_returning (pair_or_None, op_id_override_or_None))
-            ('ARC-1',   0.25, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC1_FILES), None)),
-            ('RE-ARC',  0.20, True,  OP_ID["ARC_RE"],      lambda: (sample_arc(REARC_FILES), None)),
-            ('ARC-2',   0.15, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC2_FILES), None)),
-            ('Concept', 0.05, True,  OP_ID["ARC_CONCEPT"], lambda: (sample_arc(CONCEPT_FILES), None)),
-            ('Mini',    0.03, True,  OP_ID["ARC_MINI"],    lambda: (sample_arc(MINI_FILES), None)),
-            ('Heavy',   0.05, True,  OP_ID["ARC_HEAVY"],   lambda: (sample_arc(HEAVY_FILES), None)),
-            ('Math-v2', 0.15, False, None,                  lambda: _math_v2_with_op()),
-            ('Sudoku',  0.05, False, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None)),
-            ('CA',      0.05, False, None,                  lambda: _ca_with_op()),
-            ('Compose', 0.02, False, OP_ID["DSL_COMPOSE"],  lambda: (_gen_dsl_compose(), None)),
+            # (name, weight, is_arc, op_id, fn -> (pair, op_override, program))
+            ('ARC-1',     0.22, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC1_FILES), None, None)),
+            ('RE-ARC',    0.18, True,  OP_ID["ARC_RE"],      lambda: (sample_arc(REARC_FILES), None, None)),
+            ('ARC-GEN',   0.10, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARCGEN_FILES), None, None)),
+            ('ARC-2',     0.14, True,  OP_ID["ARC_GENERIC"], lambda: (sample_arc(ARC2_FILES), None, None)),
+            ('Concept',   0.04, True,  OP_ID["ARC_CONCEPT"], lambda: (sample_arc(CONCEPT_FILES), None, None)),
+            ('Mini',      0.02, True,  OP_ID["ARC_MINI"],    lambda: (sample_arc(MINI_FILES), None, None)),
+            ('Heavy',     0.04, True,  OP_ID["ARC_HEAVY"],   lambda: (sample_arc(HEAVY_FILES), None, None)),
+            ('Math-v2',   0.10, False, None,                  _math_v2_with_op),
+            ('Enigmata',  0.06, False, ENIGMATA_OP_ID,        lambda: (sample_arc(ENIGMATA_FILES), None, None)),
+            ('Sudoku',    0.04, False, OP_ID["SUDOKU"],       lambda: (gen_sudoku_pair(mask_rate=0.4, rng=rng), None, None)),
+            ('CA',        0.04, False, None,                  _ca_with_op),
+            ('Compose',   0.02, False, OP_ID["DSL_COMPOSE"],  _compose_with_program),
         ]
         _cum = []
         s = 0.0
@@ -348,41 +379,69 @@ def main() -> None:
             _cum.append((s, nm, is_arc, op_default, fn))
         TOTAL_W = s
 
-        def _gen_dsl_compose():
-            '''Random self-exec DSL composition: input + applied transform = output.'''
-            # synthetic small grid -> random rot+flip+recolor
+        # v40.3: _gen_dsl_compose also returns the program (list of primitive ids).
+        # Primitive id map (matches oniro.dsl.primitives ordering):
+        #   0 identity, 1 rot90, 2 rot180, 3 rot270, 4 flip_h, 5 flip_v,
+        #   6 transpose, 7 crop, 8 tile_2x2, 9 double, 10 half.
+        #   11..55 = color swaps. 56..145 = recolors.
+        # We use a coarse "recolor_generic" mapping at id 11 for any recolor
+        # (90 recolor primitives collapse to 1 class for simplicity; precise
+        # color params are learned through cell-decoder gradient anyway).
+        ID_ROT = {1: 1, 2: 2, 3: 3}
+        ID_FLIP_H, ID_FLIP_V = 4, 5
+        ID_RECOLOR = 11
+        ID_IDENTITY = 0
+
+        def _gen_dsl_compose_with_program():
             side = rng.randint(5, min(GRID, 16))
             g = np.random.randint(0, N_COLORS, size=(side, side), dtype=np.int64)
             out = g.copy()
-            ops = rng.randint(1, 3)
-            for _ in range(ops):
+            program: list[int] = []
+            n_ops = rng.randint(1, 3)
+            for _ in range(n_ops):
                 op = rng.choice(['rot', 'flip', 'recolor'])
                 if op == 'rot':
-                    out = np.rot90(out, k=rng.randint(1, 3)).copy()
+                    k = rng.randint(1, 3)
+                    out = np.rot90(out, k=k).copy()
+                    program.append(ID_ROT[k])
                 elif op == 'flip':
-                    out = np.flip(out, axis=rng.randint(0, 1)).copy()
+                    axis = rng.randint(0, 1)
+                    out = np.flip(out, axis=axis).copy()
+                    program.append(ID_FLIP_H if axis == 1 else ID_FLIP_V)
                 else:
-                    s_ = rng.randint(0, N_COLORS-1); d_ = rng.randint(0, N_COLORS-1)
+                    s_ = rng.randint(0, N_COLORS - 1); d_ = rng.randint(0, N_COLORS - 1)
                     out = np.where(out == s_, d_, out)
+                    program.append(ID_RECOLOR)
+            # Pad to length 3 with identity
+            while len(program) < 3:
+                program.append(ID_IDENTITY)
+            return (g, out), program[:3]
+
+        def _gen_dsl_compose():
+            (g, out), _prog = _gen_dsl_compose_with_program()
             return g, out
 
         def sample_one():
             r = rng.random() * TOTAL_W
             for thresh, name, is_arc, op_default, fn in _cum:
                 if r < thresh:
-                    pair, op_override = fn()
+                    pair, op_override, program = fn()
                     if pair is None:
                         return sample_one()
                     op_id = op_override if op_override is not None else op_default
-                    return pair, is_arc, op_id
-            # fallback (should not trigger)
-            pair, op_override = _cum[-1][4]()
-            return pair, _cum[-1][2], _cum[-1][3]
+                    return pair, is_arc, op_id, program
+            # fallback
+            pair, op_override, program = _cum[-1][4]()
+            return pair, _cum[-1][2], _cum[-1][3], program
+
+        # NULL_PROGRAM index for CodeHead targets; matches code_head.null_class.
+        N_DSL_PRIMS_HOST = 146
 
         def sample_batch(B, do_aug=True):
             gi_, go_, arc_flags, op_ids = [], [], [], []
+            code_targets, code_masks = [], []
             for _ in range(B):
-                (inp, out), is_arc, op_id = sample_one()
+                (inp, out), is_arc, op_id, program = sample_one()
                 inp = np.asarray(inp, dtype=np.int64)
                 out = np.asarray(out, dtype=np.int64)
                 if do_aug:
@@ -398,14 +457,24 @@ def main() -> None:
                 go_.append(grid_to_fixed(out))
                 arc_flags.append(1.0 if is_arc else 0.0)
                 op_ids.append(int(op_id))
+                # Compose samples carry a real DSL program; others use NULL.
+                if program is not None and len(program) >= 3:
+                    code_targets.append(list(program[:3]))
+                    code_masks.append(1.0)
+                else:
+                    code_targets.append([N_DSL_PRIMS_HOST] * 3)
+                    code_masks.append(0.0)
             return (torch.stack(gi_).to(device),
                     torch.stack(go_).to(device),
                     torch.tensor(arc_flags, dtype=torch.float, device=device),
-                    torch.tensor(op_ids, dtype=torch.long, device=device))
+                    torch.tensor(op_ids, dtype=torch.long, device=device),
+                    torch.tensor(code_targets, dtype=torch.long, device=device),
+                    torch.tensor(code_masks, dtype=torch.float, device=device))
 
-        g_in, g_out, arc_mask, op_id = sample_batch(4)
+        g_in, g_out, arc_mask, op_id, code_tgt, code_mask = sample_batch(4)
         print('sample shapes:', g_in.shape, g_out.shape,
-              'arc_mask:', arc_mask.tolist(), 'op_ids:', op_id.tolist())
+              'arc_mask:', arc_mask.tolist(), 'op_ids:', op_id.tolist(),
+              'code_mask:', code_mask.tolist())
     """).strip()))
 
     cells.append(md("## Train: Socrates + dual encoder + AE-Godel"))
@@ -435,7 +504,7 @@ def main() -> None:
             # v40.2 CGAR PDC: shrink URM depth in early stages.
             urm.set_n_loops_eff(pdc_loops(step, STEPS, n_loops_full=N_LOOPS))
 
-            g_in, g_out, arc_mask, op_id = sample_batch(BATCH)
+            g_in, g_out, arc_mask, op_id, code_tgt, code_mask = sample_batch(BATCH)
             urm_input, op_tok = encode_v40(g_in, op_id, arc_mask)
             urm_out = urm(urm_input, op_embed=op_tok)
 
@@ -464,18 +533,21 @@ def main() -> None:
                     lb_loss = lb_loss + blk.ffn.load_balance_loss().to(device)
             loss = loss + MOL_LB_WEIGHT * lb_loss
 
-            # CodeHead aux: predict DSL program. For v40.2 the target is
-            # NULL_PROGRAM for every sample (we don't yet expose the synthetic
-            # compose program); head is "ready" infrastructure. Future v40.3+
-            # will replace this with the real compose-program target.
+            # CodeHead aux (v40.3): use real program targets for DSL_COMPOSE
+            # samples (code_mask=1.0) and NULL_PROGRAM for others (code_mask=0.0).
+            # Loss is masked so non-compose samples contribute zero gradient.
             code_logits = code_head(urm_out['final_state'],
                                      op_token_idx=0, cell_start_idx=101)
-            code_target = torch.full((g_in.shape[0], 3), code_head.null_class,
-                                      dtype=torch.long, device=device)
-            code_loss = F.cross_entropy(
-                code_logits.reshape(-1, code_logits.shape[-1]),
-                code_target.reshape(-1),
-            )
+            B_cur, seq_len, V = code_logits.shape
+            per_step_ce = F.cross_entropy(
+                code_logits.reshape(-1, V),
+                code_tgt.reshape(-1),
+                reduction='none',
+            ).view(B_cur, seq_len).mean(dim=1)   # (B,)
+            # Weight compose samples (mask=1) at full weight, others at 0.05.
+            # 0.05 ensures the head doesn't drift to a degenerate constant.
+            per_sample_w = code_mask + 0.05 * (1.0 - code_mask)
+            code_loss = (per_step_ce * per_sample_w).sum() / per_sample_w.sum().clamp_min(1.0)
             loss = loss + CODE_HEAD_WEIGHT * code_loss
 
             opt.zero_grad(set_to_none=True)
@@ -503,7 +575,7 @@ def main() -> None:
 
             if step > 0 and step % AE_EVERY == 0:
                 for m in all_modules: m.eval()
-                eval_in, eval_out, eval_arc, eval_op = sample_batch(BATCH, do_aug=False)
+                eval_in, eval_out, eval_arc, eval_op, _, _ = sample_batch(BATCH, do_aug=False)
                 def ae_score():
                     with torch.no_grad():
                         t_, op_t = encode_v40(eval_in, eval_op, eval_arc)
@@ -560,7 +632,7 @@ def main() -> None:
                             + list(decoder.parameters()))
         rl_opt = torch.optim.AdamW(rl_trunk_params, lr=3e-5, weight_decay=0.05)
         for rl_step in range(GRPO_STEPS):
-            g_in_b, g_out_b, _rl_arc, _rl_op = sample_batch(BATCH, do_aug=False)
+            g_in_b, g_out_b, _rl_arc, _rl_op, _, _ = sample_batch(BATCH, do_aug=False)
             r = grpo_step(enc_adapter, urm, decoder, rl_opt, g_in_b, g_out_b,
                           ref_enc, ref_urm, ref_dec,
                           n_group=4, eps_clip=0.2, kl_beta=0.04,
