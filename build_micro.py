@@ -126,10 +126,9 @@ def main() -> None:
         if not ARC1_DIR.exists():
             subprocess.check_call(['git','clone','--depth','1',
                 'https://github.com/fchollet/ARC-AGI.git', str(ARC1_DIR)])
-        # RE-ARC: repo ships only the GENERATOR. Generation inline was hanging
-        # in Colab sessions (rate 0/s). Skip it by default; user can run the
-        # generator manually if they want. The training will simply not see
-        # RE-ARC samples and sample_one will fall through to other sources.
+        # RE-ARC: ship only the generator. Try a SMALL inline run (10 examples
+        # per task = ~4k pairs total) with a tight 5min timeout. If it hangs
+        # or fails, skip and fall through to other sources.
         if not REARC_DIR.exists():
             try:
                 subprocess.check_call(['git','clone','--depth','1',
@@ -137,6 +136,24 @@ def main() -> None:
                     timeout=60)
             except Exception as e:
                 print(f'RE-ARC clone failed (will run without): {e}')
+        REARC_TASKS_DIR = REARC_DIR / 're_arc' / 'tasks'
+        if (REARC_DIR.exists()
+                and (not REARC_TASKS_DIR.exists()
+                     or not any(REARC_TASKS_DIR.glob('*.json')))):
+            if os.environ.get('ONIRO_SKIP_REARC_GEN') != '1':
+                print('RE-ARC: generating 10 examples per task (5min budget)...')
+                gen_code = (
+                    "import sys, os; sys.path.insert(0, %r); "
+                    "os.chdir(%r); "
+                    "from main import generate_dataset; "
+                    "generate_dataset(n_examples=10, diff_lb=0, diff_ub=1)"
+                    % (str(REARC_DIR), str(REARC_DIR))
+                )
+                try:
+                    subprocess.check_call(['python','-c',gen_code], timeout=300)
+                    print('  RE-ARC generation OK')
+                except Exception as e:
+                    print(f'  RE-ARC generation timed out / failed: {e}')
         # ARC-GEN: only generator code, no shipped data. Clone but expect 0.
         if not ARCGEN_DIR.exists():
             try:
@@ -164,15 +181,24 @@ def main() -> None:
         ARC2_ROOT = str(ARC2_DIR / 'data')
         ARC1_ROOT = str(ARC1_DIR / 'data')
         REARC_ROOT = str(REARC_DIR)
-        print('ARC2 train:', len(list(Path(ARC2_ROOT,'training').glob('*.json'))))
-        print('ARC1 train:', len(list(Path(ARC1_ROOT,'training').glob('*.json'))))
-        rearc_glob = list(Path(REARC_ROOT).rglob('*.json'))
-        print('RE-ARC json files (any):', len(rearc_glob))
-        # ARC-GEN + Enigmata enumeration (optional - if clone failed, lists are empty)
+        print('=' * 60)
+        print('Dataset inventory (training pool):')
+        print(f'  ARC-AGI-1 train:    {len(list(Path(ARC1_ROOT,"training").glob("*.json")))}')
+        print(f'  ARC-AGI-2 train:    {len(list(Path(ARC2_ROOT,"training").glob("*.json")))}')
+        rearc_glob = list(Path(REARC_ROOT).rglob('*.json')) if REARC_DIR.exists() else []
+        print(f'  RE-ARC files:       {len(rearc_glob)}')
         arcgen_files = list(ARCGEN_DIR.rglob('*.json')) if ARCGEN_DIR.exists() else []
         enigmata_files = list(ENIGMATA_DIR.rglob('*.json')) if ENIGMATA_DIR.exists() else []
-        print('ARC-GEN files:', len(arcgen_files))
-        print('Enigmata files:', len(enigmata_files))
+        concept_count = len(list((NEONEYE_DIR/'dataset'/'ConceptARC').rglob('*.json')))
+        mini_count    = len(list((NEONEYE_DIR/'dataset'/'Mini-ARC').rglob('*.json')))
+        heavy_count   = len(list((NEONEYE_DIR/'dataset'/'ARC-Heavy').rglob('*.json')))
+        print(f'  ARC-GEN files:      {len(arcgen_files)}')
+        print(f'  Enigmata files:     {len(enigmata_files)}')
+        print(f'  ConceptARC tasks:   {concept_count}')
+        print(f'  Mini-ARC tasks:     {mini_count}')
+        print(f'  ARC-Heavy tasks:    {heavy_count}')
+        print('  (Tama + BARC + H-ARC enumerated in the dataset cell below.)')
+        print('=' * 60)
     """).strip()))
 
     cells.append(code("!pip -q install einops 2>&1 | tail -2"))
@@ -413,11 +439,12 @@ def main() -> None:
         HARC_FILES = []
 
         # neoneye/arc-dataset-tama (Big ARC tasks, standard ARC JSON format)
+        # Includes ConceptARC, MiniARC, and many synthetic ARC corpora.
         if not TAMA_DIR.exists():
             try:
                 subprocess.check_call(['git','clone','--depth','1',
                     'https://github.com/neoneye/arc-dataset-tama.git', str(TAMA_DIR)],
-                    timeout=120)
+                    timeout=180)
             except Exception as e:
                 print(f'arc-dataset-tama clone failed (will run without): {e}')
         TAMA_FILES = list(TAMA_DIR.rglob('*.json')) if TAMA_DIR.exists() else []
