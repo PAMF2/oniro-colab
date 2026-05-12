@@ -29,14 +29,16 @@ def code(text: str) -> dict:
 def main() -> None:
     cells = []
     cells.append(md(textwrap.dedent("""
-        # ONIRO MICRO — URM 2.5M on Colab
+        # ONIRO v31 — URM + GRPO RL on Colab
 
         **Setup:** Runtime → Change runtime type → **T4 GPU** → Save → Run All.
 
         Pulls source from https://github.com/PAMF2/oniro-colab (public).
-        Clones ARC-1 / ARC-2. Trains URM + RIMA + DIS + AE-Gödel.
-        Evaluates on ARC-AGI-1, ARC-AGI-2, Sudoku, Math.
-        Runtime ~1-2h on Colab free T4.
+        Phase A: supervised DIS training (15k steps)
+        Phase B: GRPO RL fine-tuning (5k steps, group-relative advantage)
+        AlphaEvolve-Gödel outer mutation every 1000 steps.
+        Eval on ARC-AGI-1, ARC-AGI-2, Sudoku, Math.
+        Runtime ~3-4h on Colab free T4.
     """).strip()))
 
     cells.append(code(textwrap.dedent("""
@@ -100,6 +102,7 @@ def main() -> None:
         from oniro.data.arc2_loader import _pairs_from_task
         from oniro.data.sudoku_gen import gen_sudoku_pair
         from oniro.data.math_gen import gen_math_pair
+        from oniro.training.grpo import grpo_step, snapshot_policy
 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print('device:', device)
@@ -174,7 +177,8 @@ def main() -> None:
     """).strip()))
 
     cells.append(code(textwrap.dedent("""
-        STEPS = int(os.environ.get('ONIRO_STEPS', '5000'))
+        STEPS = int(os.environ.get('ONIRO_STEPS', '15000'))
+        GRPO_STEPS = int(os.environ.get('ONIRO_GRPO_STEPS', '3000'))
         opt = torch.optim.AdamW(all_params, lr=3e-4, weight_decay=0.05)
         ae_archive = AlphaEvolveGodelArchive()
         AE_EVERY = 1000
@@ -224,12 +228,39 @@ def main() -> None:
                 print(f'  [AE] base={base:.4f} best={best:.4f} accept={acc} reject={ae_archive.rejected}')
                 urm.train()
 
-        print(f'\\ntrained in {(time.time()-t0)/60:.1f}min')
+        print(f'\\nphase A (supervised) done in {(time.time()-t0)/60:.1f}min')
+
+        # ============= Phase B: GRPO RL fine-tuning =============
+        print(f'\\n=== Phase B: GRPO RL ({GRPO_STEPS} steps, group=4) ===')
+        ref_enc, ref_urm, ref_dec = snapshot_policy(encoder, urm, decoder)
+        for p in ref_enc.parameters(): p.requires_grad = False
+        for p in ref_urm.parameters(): p.requires_grad = False
+        for p in ref_dec.parameters(): p.requires_grad = False
+        ref_enc.to(device); ref_urm.to(device); ref_dec.to(device)
+
+        rl_opt = torch.optim.AdamW(all_params, lr=5e-5, weight_decay=0.05)
+        for rl_step in range(GRPO_STEPS):
+            g_in_b, g_out_b = sample_batch(BATCH)
+            r = grpo_step(encoder, urm, decoder, rl_opt, g_in_b, g_out_b,
+                          ref_enc, ref_urm, ref_dec,
+                          n_group=4, eps_clip=0.2, kl_beta=0.04,
+                          temperature=1.0, reward_type='cell')
+            if rl_step % 100 == 0:
+                print(f'  rl_step {rl_step:5d}  reward={r["mean_reward"]:.3f}  max_r={r["max_reward"]:.3f}  kl={r["kl"]:.3f}  loss={r["loss"]:.4f}')
+            # Refresh reference policy every 500 RL steps
+            if rl_step > 0 and rl_step % 500 == 0:
+                del ref_enc, ref_urm, ref_dec
+                ref_enc, ref_urm, ref_dec = snapshot_policy(encoder, urm, decoder)
+                ref_enc.to(device); ref_urm.to(device); ref_dec.to(device)
+                print(f'  refreshed reference policy at step {rl_step}')
+
+        print(f'\\nphase B (GRPO RL) done')
+
         ckpt_dir = ROOT / 'checkpoints'
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         torch.save({'encoder': encoder.state_dict(), 'urm': urm.state_dict(),
                     'decoder': decoder.state_dict()},
-                   str(ckpt_dir / 'urm_micro_final.pt'))
+                   str(ckpt_dir / 'urm_micro_rl_final.pt'))
     """).strip()))
 
     cells.append(md("## Eval: ARC-1, ARC-2, Sudoku, Math"))
