@@ -21,21 +21,31 @@ import numpy as np
 def pdc_loops(step: int, total_steps: int,
               n_loops_full: int = 12,
               shallow_frac: float = 0.20,
-              mid_frac: float = 0.50) -> int:
+              mid_frac: float = 0.50,
+              n_groups: int = 1) -> int:
     """Three-stage Progressive Depth Curriculum.
 
     Stage A0 (0 .. shallow_frac):  n_loops_eff = full / 3
     Stage A1 (shallow_frac .. mid_frac): n_loops_eff = 2 * full / 3
     Stage A2 (mid_frac .. 1.0):     n_loops_eff = full
 
-    Total compute saved on Phase A by running shallower depth in early stages.
+    v41 fix: when n_groups > 1, the returned value is aligned (rounded
+    down) to a multiple of n_groups, with a hard minimum of n_groups, so
+    URM.set_n_loops_eff() does not silently truncate further. Default
+    n_groups=1 keeps legacy behaviour.
     """
     frac = step / max(total_steps, 1)
     if frac < shallow_frac:
-        return max(1, n_loops_full // 3)
-    if frac < mid_frac:
-        return max(1, (2 * n_loops_full) // 3)
-    return n_loops_full
+        raw = n_loops_full // 3
+    elif frac < mid_frac:
+        raw = (2 * n_loops_full) // 3
+    else:
+        raw = n_loops_full
+    raw = max(1, raw)
+    if n_groups > 1:
+        aligned = (raw // n_groups) * n_groups
+        return max(n_groups, aligned)
+    return raw
 
 
 def hsw_weights(n_cycles: int, step: int, total_steps: int,
