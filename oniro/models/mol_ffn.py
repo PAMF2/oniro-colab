@@ -75,13 +75,18 @@ class MoLConvSwiGLU(nn.Module):
             op_vec = op_embed.squeeze(1) if op_embed.dim() == 3 else op_embed
         router_in = torch.cat([mean_tok, op_vec], dim=-1)
         router_logits = self.router(router_in)               # (B, K)
-        # v40.11: gaussian noise during training breaks router symmetry without
-        # the fp16-unfriendly double-log of the original Gumbel formulation.
         if self.training:
             router_logits = router_logits + torch.randn_like(router_logits) * 0.5
         top1_idx = router_logits.argmax(dim=-1)              # (B,)
-        usage = F.one_hot(top1_idx, num_classes=self.n_experts).float().mean(dim=0)
-        self.last_expert_usage = usage.detach()
+        # v41 FIX: load-balance from soft probs (router_softmax), not detached
+        # argmax usage. Argmax is non-differentiable so detached usage cannot
+        # train the router. Soft probs flow gradient back through self.router.
+        router_softmax = F.softmax(router_logits, dim=-1)    # (B, K), grad-tracked
+        soft_usage = router_softmax.mean(dim=0)              # (B, K) -> (K,), grad-tracked
+        target = 1.0 / self.n_experts
+        self.last_lb_loss = ((soft_usage - target) ** 2).sum()
+        # Keep hard-usage for diagnostics only (caveman log)
+        self.last_expert_usage = F.one_hot(top1_idx, num_classes=self.n_experts).float().mean(dim=0).detach()
 
         # Base path
         a = self.w1(x_norm)            # (B, T, h)
@@ -105,9 +110,18 @@ class MoLConvSwiGLU(nn.Module):
         return out_base + out_delta
 
     def load_balance_loss(self) -> torch.Tensor:
-        """Variance of expert usage. Caller multiplies and adds to total loss."""
-        if self.last_expert_usage is None:
+        """Differentiable variance of soft-routing probabilities.
+
+        v41 FIX (HIGH severity audit finding): prior version returned a loss
+        computed from `last_expert_usage` which was detached via
+        `usage.detach()`, so MOL_LB_WEIGHT contributed ZERO gradient. Router
+        never received load-balance signal and would collapse without
+        Gumbel/Gaussian noise (still collapses at eval where no noise applied).
+
+        Now returns `last_lb_loss` captured in forward() from soft probs
+        (router_softmax.mean(0)), which carries gradient back to
+        self.router weights.
+        """
+        if getattr(self, "last_lb_loss", None) is None:
             return torch.zeros(())
-        # encourage uniform usage: low variance is good
-        target = 1.0 / self.n_experts
-        return ((self.last_expert_usage - target) ** 2).sum()
+        return self.last_lb_loss
